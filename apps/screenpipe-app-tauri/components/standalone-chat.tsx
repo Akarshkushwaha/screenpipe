@@ -189,6 +189,21 @@ export function StandaloneChat({
   const [isStreaming, setIsStreaming] = useState(false);
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   const [activePreset, setActivePreset] = useState<AIPreset | undefined>();
+  const activePresetRef = useRef<AIPreset | undefined>(activePreset);
+  activePresetRef.current = activePreset;
+
+  const handleSetActivePreset = useCallback((preset: AIPreset | undefined | ((prev: AIPreset | undefined) => AIPreset | undefined)) => {
+    if (typeof preset === "function") {
+      setActivePreset((prev) => {
+        const next = preset(prev);
+        activePresetRef.current = next;
+        return next;
+      });
+    } else {
+      activePresetRef.current = preset;
+      setActivePreset(preset);
+    }
+  }, []);
   const isStreamingRef = useRef(false);
   // Mirrors of streaming-relevant state so the unmount-snapshot effect (which
   // runs with `[]` deps) can read the latest values instead of stale closures.
@@ -682,6 +697,7 @@ export function StandaloneChat({
     pendingDocsRef,
     settings,
     selectedPreset: activePreset ?? null,
+    selectedPresetRef: activePresetRef,
     inlineHistoryEnabled: !hideInlineHistory,
   });
   const loadConversationRef = useRef(loadConversation);
@@ -733,7 +749,7 @@ export function StandaloneChat({
   });
   useChatWindowSyncEvents({
     aiPresets: settings?.aiPresets,
-    setActivePreset,
+    setActivePreset: handleSetActivePreset,
   });
 
   const {
@@ -775,7 +791,7 @@ export function StandaloneChat({
     syncThinkingLevelAfterStart,
   } = usePiSessionLifecycle({
     activePreset,
-    setActivePreset,
+    setActivePreset: handleSetActivePreset,
     aiPresets: settings.aiPresets,
     isSettingsLoaded,
     shouldFreezePresetSelection: Boolean(activePipeExecution),
@@ -814,7 +830,7 @@ export function StandaloneChat({
 
   usePipeWatchSession({
     aiPresets: settings.aiPresets,
-    setActivePreset,
+    setActivePreset: handleSetActivePreset,
     startPipeExecution,
     loadConversationRef,
     setIsStreaming,
@@ -833,6 +849,7 @@ export function StandaloneChat({
     abortControllerRef,
     activePipeExecution,
     activePreset,
+    activePresetRef,
     attachedDocsRef,
     autoSendBypassRef,
     buildProviderConfig,
@@ -899,6 +916,7 @@ export function StandaloneChat({
 
   usePiForegroundEvents({
     activePreset,
+    activePresetRef,
     buildProviderConfig,
     cancelStreamingMessageRender,
     clearPipeExecution,
@@ -1259,7 +1277,7 @@ export function StandaloneChat({
           activePipeExecution,
           currentQueueSessionId,
           onPresetSaved: handlePiRestart,
-          onSelectPreset: setActivePreset,
+          onSelectPreset: handleSetActivePreset,
         }}
         connectBanner={{
           show: showConnectBanner,

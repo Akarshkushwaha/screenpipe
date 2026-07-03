@@ -33,6 +33,7 @@ const POST_STREAM_SIDE_EFFECT_DELAY_MS = 1_500;
 
 export function usePiForegroundEvents({
   activePreset,
+  activePresetRef,
   buildProviderConfig,
   cancelStreamingMessageRender,
   clearPipeExecution,
@@ -80,6 +81,7 @@ export function usePiForegroundEvents({
   syncThinkingLevelAfterStart,
   turnIntentTextValuesMatch,
 }: PiForegroundEventsOptions) {
+  const getActivePreset = () => activePresetRef?.current ?? activePreset;
   // Listen for Pi / pipe events.
   //
   // Stage 3 of the events refactor: the panel registers with the
@@ -140,8 +142,8 @@ export function usePiForegroundEvents({
           role: "assistant",
           content: "Processing...",
           timestamp: Date.now(),
-          model: activePreset?.model,
-          provider: activePreset?.provider,
+          model: getActivePreset()?.model,
+          provider: getActivePreset()?.provider,
         });
         return base;
       });
@@ -159,8 +161,8 @@ export function usePiForegroundEvents({
           role: "assistant",
           content: "Processing...",
           timestamp: Date.now(),
-          model: activePreset?.model,
-          provider: activePreset?.provider,
+          model: getActivePreset()?.model,
+          provider: getActivePreset()?.provider,
         } as any);
         storeState.actions.setStreaming(sidNow, {
           streamingMessageId: newAssistantId,
@@ -395,7 +397,7 @@ export function usePiForegroundEvents({
               );
             }
           } else {
-            const providerError = buildProviderErrorMessage(errorStr, activePreset);
+            const providerError = buildProviderErrorMessage(errorStr, getActivePreset());
             if (providerError && piMessageIdRef.current) {
               const msgId = piMessageIdRef.current;
               setMessages((prev) =>
@@ -434,7 +436,7 @@ export function usePiForegroundEvents({
                 prev.map((m) => m.id === msgId ? { ...m, content: "This model requires an upgrade to Screenpipe Business. Switch to a free model (auto, glm-5, gemini flash) to keep going." } : m)
               );
             } else {
-              const providerError = buildProviderErrorMessage(fullError, activePreset);
+              const providerError = buildProviderErrorMessage(fullError, getActivePreset());
               if (providerError) {
                 setMessages((prev) =>
                   prev.map((m) => m.id === msgId
@@ -552,8 +554,8 @@ export function usePiForegroundEvents({
               ...(matchedTurnIntent ? { turnIntentId: matchedTurnIntent.id } : {}),
               ...(nextUserIntent === "steer" ? { steeredResponse: true } : {}),
               timestamp: Date.now(),
-              model: activePreset?.model,
-              provider: activePreset?.provider,
+              model: getActivePreset()?.model,
+              provider: getActivePreset()?.provider,
             };
 
             let nextRows: Message[] | null = null;
@@ -608,7 +610,7 @@ export function usePiForegroundEvents({
             const msgId = piMessageIdRef.current;
 
             const quotaErrorType = classifyQuotaError(errMsg);
-            const providerError = buildProviderErrorMessage(errMsg, activePreset);
+            const providerError = buildProviderErrorMessage(errMsg, getActivePreset());
             if (authTokenInvalidated) {
               setMessages((prev) =>
                 prev.map((m) => m.id === msgId ? { ...m, content: buildInvalidatedAuthTokenMessage() } : m)
@@ -682,7 +684,7 @@ export function usePiForegroundEvents({
               } else if (errStr.includes("model_not_allowed")) {
                 content = "This model requires an upgrade to Screenpipe Business. Switch to a free model (auto, glm-5, gemini flash) to keep going.";
               } else {
-                content = buildProviderErrorMessage(errStr, activePreset) || errStr;
+                content = buildProviderErrorMessage(errStr, getActivePreset()) || errStr;
               }
             }
 
@@ -733,10 +735,10 @@ export function usePiForegroundEvents({
                 } else if (lastErr && lastErrKind === "rate") {
                   content = buildRateLimitMessage(lastErr);
                 } else if (lastErr) {
-                  content = buildProviderErrorMessage(lastErr, activePreset) || `Error: ${lastErr}`;
+                  content = buildProviderErrorMessage(lastErr, getActivePreset()) || `Error: ${lastErr}`;
                   emptyResponseRetryPrompt = lastUserMessageRef.current || undefined;
                 } else {
-                  content = buildNoResponseMessage(activePreset);
+                  content = buildNoResponseMessage(getActivePreset());
                   emptyResponseRetryPrompt = lastUserMessageRef.current || undefined;
                 }
               }
@@ -751,8 +753,8 @@ export function usePiForegroundEvents({
             });
             if (!isPipeWatch) {
               const analyticsPayload = {
-                provider: activePreset?.provider,
-                model: activePreset?.model,
+                provider: getActivePreset()?.provider,
+                model: getActivePreset()?.model,
                 has_tool_use: blocksSnapshot.some((b) => b.type === "tool"),
                 response_length: streamedText?.length ?? 0,
               };
@@ -854,7 +856,7 @@ export function usePiForegroundEvents({
                 prev.map((m) => m.id === msgId ? { ...m, content: "This model requires an upgrade to Screenpipe Business. Switch to a free model (auto, glm-5, gemini flash) to keep going." } : m)
               );
             } else {
-              const providerError = buildProviderErrorMessage(errorStr, activePreset);
+              const providerError = buildProviderErrorMessage(errorStr, getActivePreset());
               if (providerError) {
                 setMessages((prev) =>
                   prev.map((m) => m.id === msgId
@@ -892,8 +894,8 @@ export function usePiForegroundEvents({
             : errorStr.includes("model_not_allowed") ? "model_not_allowed"
             : "other";
           posthog.capture("chat_response_error", {
-            provider: activePreset?.provider,
-            model: activePreset?.model,
+            provider: getActivePreset()?.provider,
+            model: getActivePreset()?.model,
             error_type: errorCategory,
           });
           piStreamingTextRef.current = "";

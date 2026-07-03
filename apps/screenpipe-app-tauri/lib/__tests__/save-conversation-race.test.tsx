@@ -56,6 +56,7 @@ const saveCalls: Array<{
   browserState?: any;
   lastUserMessageAt?: number;
   lastViewedAt?: number;
+  presetId?: string;
 }> = [];
 
 vi.mock("@/lib/chat-storage", () => ({
@@ -66,6 +67,7 @@ vi.mock("@/lib/chat-storage", () => ({
       browserState: conv.browserState,
       lastUserMessageAt: conv.lastUserMessageAt,
       lastViewedAt: conv.lastViewedAt,
+      presetId: conv.presetId,
     });
   }),
   loadConversationFile: vi.fn(async () => null),
@@ -108,6 +110,8 @@ function useHarness(args: {
   initialMessages: any[];
   initialConversationId: string | null;
   initialPiSessionId: string;
+  selectedPreset?: any;
+  selectedPresetRef?: any;
 }) {
   const messagesRef = useRef(args.initialMessages);
   const conversationIdRef = useRef<string | null>(args.initialConversationId);
@@ -141,6 +145,8 @@ function useHarness(args: {
     setPastedImages: vi.fn() as any,
     settings: { chatHistory: { historyEnabled: true } },
     inlineHistoryEnabled: false,
+    selectedPreset: args.selectedPreset ?? null,
+    selectedPresetRef: args.selectedPresetRef,
   });
 
   return { hook, messagesRef, conversationIdRef, piSessionIdRef };
@@ -315,5 +321,29 @@ describe("saveConversation race (PR #3600 / issue #3636 candidate)", () => {
 
     expect(saveCalls).toHaveLength(1);
     expect(saveCalls[0].lastViewedAt).toBe(8_500);
+  });
+
+  it("resolves selectedPreset via ref when available to prevent stale closure on summary card click (#4820)", async () => {
+    const selectedPresetRef = { current: { id: "argus", model: "argus-model", provider: "ollama" } as any };
+    const messages = [
+      { id: "u1", role: "user" as const, content: "hello", timestamp: 1_000 },
+    ];
+
+    const { result } = renderHook(() =>
+      useHarness({
+        initialMessages: messages,
+        initialConversationId: "chat-card",
+        initialPiSessionId: "chat-card",
+        selectedPreset: { id: "gpt-4o", model: "gpt-4o", provider: "openai" } as any, // Stale closure value
+        selectedPresetRef, // Latest ref value
+      }),
+    );
+
+    await act(async () => {
+      await result.current.hook.saveConversation(messages);
+    });
+
+    expect(saveCalls).toHaveLength(1);
+    expect(saveCalls[0].presetId).toBe("argus");
   });
 });
