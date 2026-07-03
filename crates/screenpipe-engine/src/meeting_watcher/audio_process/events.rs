@@ -5,17 +5,7 @@
 
 use super::*;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct CalendarEventSignal {
-    pub title: String,
-    pub start: String,
-    pub end: String,
-    #[serde(default)]
-    pub attendees: Vec<String>,
-    #[serde(default)]
-    pub is_all_day: bool,
-}
+pub(crate) use crate::meeting_watcher::shared::calendar::CalendarEventSignal;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct MeetingAutoEndRequest {

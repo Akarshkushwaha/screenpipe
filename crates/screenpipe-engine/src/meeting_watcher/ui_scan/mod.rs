@@ -130,6 +130,8 @@ pub async fn run_meeting_detection_loop(
     // If the calendar isn't connected, this stream simply never yields — safe no-op.
     let mut cal_sub = subscribe_to_event::<Vec<CalendarEventSignal>>("calendar_events");
     let mut calendar_events: Vec<CalendarEventSignal> = Vec::new();
+    let mut prewarmed: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
 
     // Subscribe to explicit stop signals from the API layer
     let mut stop_sub = subscribe_to_event::<DetectorStopSignal>("detector_stop_tracking");
@@ -215,6 +217,15 @@ pub async fn run_meeting_detection_loop(
         // Skip if manual meeting is active
         {
             let manual = manual_meeting.read().await;
+            crate::meeting_watcher::shared::calendar::check_and_emit_prewarm(
+                &calendar_events,
+                &mut prewarmed,
+                manual.is_some()
+                    || detector
+                        .as_ref()
+                        .map(|d| d.is_in_meeting())
+                        .unwrap_or(false),
+            );
             if manual.is_some() {
                 debug!("meeting v2: manual meeting active, skipping scan");
                 continue;

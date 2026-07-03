@@ -16,15 +16,11 @@ use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::notifications::client;
 use crate::store::SettingsStore;
-
-/// How long a calendar prewarm suppresses the audio/UI-driven `meeting_started`
-/// toast for the same event. Long enough to cover the back half of the call,
-/// short enough that a recurring standup tomorrow gets its own toast.
-const PREWARM_SUPPRESS_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+use screenpipe_engine::meeting_watcher::PREWARM_SUPPRESS_TTL;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct MeetingStartedEvent {
@@ -53,6 +49,8 @@ struct MeetingPrewarmEvent {
     start: String,
     #[serde(default)]
     meeting_url: Option<String>,
+    #[serde(default)]
+    attendees: Vec<String>,
     #[serde(default)]
     seconds_until_start: i64,
 }
@@ -214,6 +212,62 @@ pub fn start(app: AppHandle) {
                 guard.insert(prewarm_key(&data.title, &data.start), Instant::now());
                 guard.retain(|_, t| t.elapsed() < PREWARM_SUPPRESS_TTL);
             }
+            let mut started_meeting_id: Option<i64> = None;
+            let mut note_url: Option<String> = None;
+            if let Some((port, api_key)) = local_api_config(&prewarm_app).await {
+                let url = format!("http://127.0.0.1:{port}/meetings/start");
+                let client = reqwest::Client::new();
+                let mut req = client.post(&url).json(&serde_json::json!({
+                    "app": "manual",
+                    "title": data.title,
+                    "attendees": data.attendees.join(", "),
+                }));
+                if let Some(key) = api_key.filter(|k| !k.is_empty()) {
+                    req = req.bearer_auth(key);
+                }
+                match req.send().await {
+                    Ok(resp) => {
+                        if resp.status().is_success() {
+                            match resp.json::<serde_json::Value>().await {
+                                Ok(val) => {
+                                    if let Some(id) = val.get("id").and_then(|v| v.as_i64()) {
+                                        info!("meeting prewarm: auto-started meeting note id={}", id);
+                                        started_meeting_id = Some(id);
+                                        let u = format!("http://127.0.0.1:{port}/meetings/{id}");
+                                        note_url = Some(u);
+                                        let payload = serde_json::json!({
+                                            "meetingId": id,
+                                            "transcript": true,
+                                        });
+                                        let nav = serde_json::json!({ "url": "/home?section=meetings" });
+                                        // Staggered emits ensure frontend receives navigation/open events across route transitions.
+                                        for delay_ms in [150_u64, 500, 1200, 2200] {
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                                            if let Err(e) = prewarm_app.emit("navigate", nav.clone()) {
+                                                debug!("meeting prewarm: failed to emit navigate: {}", e);
+                                            }
+                                            if let Err(e) = prewarm_app.emit("open-meeting-note", payload.clone()) {
+                                                debug!("meeting prewarm: failed to emit open-meeting-note: {}", e);
+                                            }
+                                        }
+                                        let _ = crate::commands::show_window_activated(
+                                            prewarm_app.clone(),
+                                            crate::window::ShowRewindWindow::Home {
+                                                page: Some("/home?section=meetings".to_string()),
+                                            },
+                                        )
+                                        .await;
+                                    }
+                                }
+                                Err(e) => debug!("meeting prewarm: failed to parse json response: {}", e),
+                            }
+                        } else {
+                            debug!("meeting prewarm: meetings/start returned status {}", resp.status());
+                        }
+                    }
+                    Err(e) => debug!("meeting prewarm: meetings/start request failed: {}", e),
+                }
+            }
 
             let mut actions = Vec::new();
             if let Some(url) = data.meeting_url.as_ref().filter(|u| !u.trim().is_empty()) {
@@ -226,10 +280,7 @@ pub fn start(app: AppHandle) {
                     "primary": true,
                 }));
             }
-            // Prewarm fires before the meeting row exists; the HD action
-            // uses a timer-bound fallback so it's still safe to click. No
-            // note deeplink yet — keeps the plain "+ HD" label.
-            if let Some(hd) = build_hd_action(&prewarm_app, None, None) {
+            if let Some(hd) = build_hd_action(&prewarm_app, started_meeting_id, note_url.as_deref()) {
                 actions.push(hd);
             }
 

@@ -530,6 +530,8 @@ fn test_calendar_event_keep_alive() {
         end: rfc(end),
         attendees: vec![],
         is_all_day: all_day,
+        location: None,
+        meeting_url: None,
     };
 
     // Event in progress now → keep the meeting alive.

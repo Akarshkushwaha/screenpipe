@@ -16,6 +16,7 @@ pub(crate) mod shared;
 pub(crate) mod ui_scan;
 
 // Public surface consumed by other crates via `screenpipe_engine::meeting_watcher::…`.
+pub use shared::calendar::PREWARM_SUPPRESS_TTL;
 pub use shared::profiles::{load_detection_profiles, MeetingDetectionProfile};
 pub use shared::scanner::{MeetingUiScanner, ScanResult};
 pub use shared::state::{advance_state, audio_or_calendar_keepalive, MeetingState, StateAction};

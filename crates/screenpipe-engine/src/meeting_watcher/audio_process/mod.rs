@@ -139,6 +139,8 @@ pub async fn run_audio_process_meeting_detection_loop(
 
     let mut cal_sub = subscribe_to_event::<Vec<CalendarEventSignal>>("calendar_events");
     let mut calendar_events: Vec<CalendarEventSignal> = Vec::new();
+    let mut prewarmed: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
     let mut stop_sub = subscribe_to_event::<DetectorStopSignal>("detector_stop_tracking");
     let mut auto_end_sub =
         subscribe_to_event::<MeetingAutoEndRequest>("meeting_auto_end_requested");
@@ -190,6 +192,15 @@ pub async fn run_audio_process_meeting_detection_loop(
 
         {
             let manual = manual_meeting.read().await;
+            crate::meeting_watcher::shared::calendar::check_and_emit_prewarm(
+                &calendar_events,
+                &mut prewarmed,
+                manual.is_some()
+                    || detector
+                        .as_ref()
+                        .map(|d| d.is_in_meeting())
+                        .unwrap_or(false),
+            );
             if manual.is_some() {
                 debug!(
                     "audio-process meeting detector: manual meeting active, skipping auto detection"
