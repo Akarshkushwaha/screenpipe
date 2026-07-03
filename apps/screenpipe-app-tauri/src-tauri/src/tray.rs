@@ -6,9 +6,10 @@ use crate::commands::{hide_main_window, show_main_window};
 use crate::enterprise_policy::{is_app_ui_hidden, is_tray_item_hidden};
 use crate::health::{
     get_audio_device_status, get_high_fps_status, get_recording_info, get_recording_status,
-    set_high_fps_status, DeviceKind, HighFpsCacheEntry, RecordingStatus,
+    get_vision_device_status, set_high_fps_status, DeviceKind, HighFpsCacheEntry, RecordingStatus,
 };
-use crate::recording::{local_api_context_from_app, RecordingState, PRE_EXIT_TEARDOWN_TIMEOUT};
+use crate::process_exit;
+use crate::recording::{local_api_context_from_app, RecordingState};
 use crate::store::{OnboardingStore, SettingsStore};
 use crate::updates::{is_enterprise_build, is_source_build};
 use crate::window::ShowRewindWindow;
@@ -32,15 +33,8 @@ use tauri_plugin_opener::OpenerExt;
 
 use tracing::{debug, error, info, warn};
 
-/// Flag set by the "quit screenpipe" menu item so that the ExitRequested
-/// handler in main.rs knows this is an intentional quit (not just a window close).
-pub static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-/// Latched once a quit teardown has started so repeated "Quit" clicks don't each
-/// spawn another blocking teardown. In the 2026-06-26 MacBook Air hang the user
-/// rage-clicked Quit while an update-restart looked frozen, and each click piled
-/// another unbounded `stop_screenpipe` onto the same wedged capture lock.
-pub static QUIT_TEARDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+/// Re-export for callers that already import from tray.
+pub use crate::process_exit::QUIT_REQUESTED;
 
 /// Pre-fetched data for building the tray menu. All store reads, settings
 /// deserialization, and permission checks happen OFF the main thread; only
@@ -340,23 +334,42 @@ fn get_effective_recording_status() -> RecordingStatus {
     real
 }
 
-/// Keep the active tray menu alive and defer macOS menu replacement safely.
+/// Keep the active tray menu alive and replace the macOS menu only while it is
+/// CLOSED.
 ///
-/// muda's macOS backend stores raw `*const MenuChild` pointers as NSMenuItem
-/// instance variables. When `tray.set_menu(new_menu)` is called while the old
-/// menu is still displayed, the old `MenuChild` items can be freed while their
-/// NSMenuItems survive. Clicking an item in that stale menu makes
-/// `fire_menu_item_click` dereference freed memory inside an `extern "C"`
-/// callback, so catch_unwind cannot keep the process alive.
+/// Two hazards govern when `tray.set_menu(new_menu)` is safe on macOS:
 ///
-/// We avoid background `set_menu` on macOS. The poller caches the latest menu
-/// inputs, then the tray mouse-down handler installs that menu before AppKit
-/// opens the native menu.
+/// 1. Use-after-free (#3813): muda's macOS backend ties each NSMenuItem to a
+///    Rust `MenuChild`. Replacing the menu while it is *displayed* frees the old
+///    items while AppKit still references them — a click then dereferences freed
+///    memory in `fire_menu_item_click` (an `extern "C"` callback). The muda fork
+///    now keeps `MenuChild` alive via an `Rc`, but we still never want to swap a
+///    presented menu.
+/// 2. Flash: a status-item menu opens on mouse-DOWN via `performClick`, which
+///    enters AppKit's modal menu tracking synchronously. tao drains its event
+///    queue in `kCFRunLoopCommonModes` — which *includes* the menu's
+///    `NSEventTrackingRunLoopMode` — so a `set_menu` triggered from the
+///    mouse-down handler lands WHILE the menu is presenting and AppKit dismisses
+///    it. That was the "first click flashes then closes, second click opens" bug.
+///
+/// So the poller never calls `set_menu` directly; it caches the latest menu
+/// inputs in `PENDING_TRAY_MENU` and marks `TRAY_MENU_DIRTY`. A `CFRunLoopObserver`
+/// registered for `kCFRunLoopDefaultMode` ONLY (see `menu_refresh_observer`)
+/// installs the queued menu when the run loop is idle — i.e. when no menu is
+/// open. Default-mode observers never fire during menu tracking, so the swap can
+/// never overlap a presented menu: no flash, no UAF. Each open shows an
+/// up-to-date menu built from freshly-prefetched data.
 static ACTIVE_TRAY_MENU: Lazy<Mutex<Option<tauri::menu::Menu<Wry>>>> =
     Lazy::new(|| Mutex::new(None));
 
 static PENDING_TRAY_MENU: Lazy<Mutex<Option<(MenuState, TrayMenuData)>>> =
     Lazy::new(|| Mutex::new(None));
+
+/// Set when a fresh tray menu has been queued into `PENDING_TRAY_MENU` and not
+/// yet installed. Read by the main-run-loop observer so it rebuilds the menu
+/// only when something actually changed (the observer fires on every idle).
+#[cfg(target_os = "macos")]
+static TRAY_MENU_DIRTY: AtomicBool = AtomicBool::new(false);
 
 fn install_tray_menu(tray: &TrayIcon, menu: tauri::menu::Menu<Wry>) -> Result<()> {
     {
@@ -374,8 +387,21 @@ fn clear_pending_tray_menu() {
 
 #[cfg(target_os = "macos")]
 fn queue_pending_tray_menu(state: MenuState, data: TrayMenuData) {
-    let mut pending = PENDING_TRAY_MENU.lock().unwrap_or_else(|e| e.into_inner());
-    *pending = Some((state, data));
+    {
+        let mut pending = PENDING_TRAY_MENU.lock().unwrap_or_else(|e| e.into_inner());
+        *pending = Some((state, data));
+    }
+    TRAY_MENU_DIRTY.store(true, Ordering::Release);
+    // Wake the main run loop so the default-mode observer fires promptly (and
+    // installs the menu while it's closed) instead of waiting for the next
+    // unrelated event. CFRunLoop* are safe to call from this tokio thread.
+    unsafe {
+        use core_foundation_sys::runloop::{CFRunLoopGetMain, CFRunLoopWakeUp};
+        let main = CFRunLoopGetMain();
+        if !main.is_null() {
+            CFRunLoopWakeUp(main);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -398,6 +424,83 @@ fn apply_pending_tray_menu(app: &AppHandle) -> Result<()> {
         install_tray_menu(&tray, menu)?;
     }
     Ok(())
+}
+
+/// Installs the queued tray menu while no menu is open — the only flash-free,
+/// crash-free moment to call `set_menu` on macOS (see the `ACTIVE_TRAY_MENU`
+/// doc above for the two hazards).
+///
+/// A `CFRunLoopObserver` registered for `kCFRunLoopDefaultMode` only fires when
+/// the main run loop is idle; it is skipped entirely while a status-item menu is
+/// in its `NSEventTrackingRunLoopMode` modal loop. So whenever the poller queues
+/// a fresh menu (and wakes the loop), this installs it moments later while the
+/// menu is closed — never overlapping a presented menu.
+#[cfg(target_os = "macos")]
+mod menu_refresh_observer {
+    use super::{apply_pending_tray_menu, TRAY_MENU_DIRTY};
+    use core_foundation_sys::runloop::{
+        kCFRunLoopBeforeWaiting, kCFRunLoopDefaultMode, CFRunLoopActivity, CFRunLoopAddObserver,
+        CFRunLoopGetMain, CFRunLoopObserverContext, CFRunLoopObserverCreate, CFRunLoopObserverRef,
+    };
+    use std::os::raw::c_void;
+    use std::sync::atomic::Ordering;
+    use std::sync::Once;
+    use tauri::AppHandle;
+    use tracing::error;
+
+    /// Fires on every main-loop idle (default mode only). Cheap no-op unless a
+    /// menu refresh was queued. Runs on the main thread, so the AppKit work in
+    /// `apply_pending_tray_menu` is safe here.
+    extern "C" fn on_idle(_observer: CFRunLoopObserverRef, _activity: CFRunLoopActivity, info: *mut c_void) {
+        if !TRAY_MENU_DIRTY.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if info.is_null() {
+            return;
+        }
+        // SAFETY: `info` is the leaked AppHandle from `install`, valid for the
+        // whole process lifetime.
+        let app = unsafe { &*(info as *const AppHandle) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Err(e) = apply_pending_tray_menu(app) {
+                error!("failed to install queued tray menu on idle: {}", e);
+            }
+        }));
+    }
+
+    /// Register the observer once on the main run loop.
+    pub fn install(app: &AppHandle) {
+        static INSTALLED: Once = Once::new();
+        INSTALLED.call_once(|| {
+            // Leak one AppHandle for the observer's (app-lifetime) callback.
+            let info = Box::into_raw(Box::new(app.clone())) as *mut c_void;
+            let mut context = CFRunLoopObserverContext {
+                version: 0,
+                info,
+                retain: None,
+                release: None,
+                copyDescription: None,
+            };
+            unsafe {
+                let observer = CFRunLoopObserverCreate(
+                    std::ptr::null(), // default allocator
+                    kCFRunLoopBeforeWaiting,
+                    1, // repeats
+                    0, // order
+                    on_idle,
+                    &mut context,
+                );
+                if observer.is_null() {
+                    error!("failed to create tray-menu run-loop observer");
+                    // Reclaim the leaked AppHandle so we don't leak on failure.
+                    drop(Box::from_raw(info as *mut AppHandle));
+                    return;
+                }
+                CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopDefaultMode);
+                // `observer` is intentionally leaked: it lives for the app's lifetime.
+            }
+        });
+    }
 }
 
 #[derive(Default, PartialEq, Clone)]
@@ -437,6 +540,11 @@ pub fn setup_tray(app: &AppHandle, update_item: Option<&tauri::menu::MenuItem<Wr
         let menu = create_dynamic_menu(app, &MenuState::default(), update_item, &data)?;
         install_tray_menu(&main_tray, menu)?;
         clear_pending_tray_menu();
+
+        // Install the idle observer that swaps in queued menus while no menu is
+        // open (flash-free, crash-free). Once-guarded, so recreate_tray is fine.
+        #[cfg(target_os = "macos")]
+        menu_refresh_observer::install(app);
 
         // Setup click handlers
         setup_tray_click_handlers(&main_tray)?;
@@ -691,19 +799,39 @@ fn create_dynamic_menu(
     {
         let info = get_recording_info();
 
-        // Show monitors (non-clickable)
-        for device in info
+        // Monitors: CheckMenuItem when the sidecar reports a numeric id (per-display
+        // pause via /vision/device/*). Older sidecars stay display-only.
+        let vision_status = get_vision_device_status();
+        let mut monitors: Vec<_> = info
             .devices
             .iter()
             .filter(|d| d.kind == DeviceKind::Monitor)
-        {
-            let dot = if device.active { "●" } else { "○" };
-            let label = format!("  {} ▣ {}", dot, device.name);
-            menu_builder = menu_builder.item(
-                &MenuItemBuilder::with_id(format!("monitor_{}", device.name), label)
-                    .enabled(false)
-                    .build(app)?,
-            );
+            .collect();
+        monitors.sort_by(|a, b| a.name.cmp(&b.name));
+        for device in monitors {
+            let label = format!("  ▣ {}", device.name);
+            if let Some(monitor_id) = device.monitor_id {
+                let is_active = vision_status
+                    .iter()
+                    .find(|d| d.id == monitor_id)
+                    .map(|d| !d.user_disabled)
+                    .unwrap_or(device.active);
+                let toggle = CheckMenuItemBuilder::with_id(
+                    format!("toggle_vision_device_{}", monitor_id),
+                    label,
+                )
+                .checked(is_active)
+                .build(app)?;
+                menu_builder = menu_builder.item(&toggle);
+            } else {
+                let dot = if device.active { "●" } else { "○" };
+                let fallback_label = format!("  {} ▣ {}", dot, device.name);
+                menu_builder = menu_builder.item(
+                    &MenuItemBuilder::with_id(format!("monitor_{}", device.name), fallback_label)
+                        .enabled(false)
+                        .build(app)?,
+                );
+            }
         }
 
         // Show only the audio devices from get_recording_info (the ones
@@ -900,28 +1028,13 @@ fn setup_tray_click_handlers(main_tray: &TrayIcon) -> Result<()> {
         }
     });
 
-    #[cfg(target_os = "macos")]
-    {
-        main_tray.on_tray_icon_event(|tray, event| {
-            if let tauri::tray::TrayIconEvent::Click {
-                button_state: tauri::tray::MouseButtonState::Down,
-                ..
-            } = event
-            {
-                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let app = tray.app_handle().clone();
-                    if let Err(e) = apply_pending_tray_menu(&app) {
-                        error!("failed to refresh tray menu before open: {}", e);
-                    }
-                })) {
-                    error!(
-                        "panic caught while refreshing tray menu before open: {:?}",
-                        e
-                    );
-                }
-            }
-        });
-    }
+    // macOS note: we deliberately do NOT install the queued menu from an
+    // on_tray_icon_event(Down) handler. That runs while AppKit is opening the
+    // menu (tao drains its event queue in kCFRunLoopCommonModes, which includes
+    // the menu's NSEventTrackingRunLoopMode), so set_menu would land mid-present
+    // and AppKit would dismiss the just-opened menu — the "first click flashes
+    // then closes" bug. The default-mode CFRunLoopObserver installed in
+    // setup_tray (menu_refresh_observer) does the swap while the menu is closed.
 
     // Windows: left-click opens the app (like macOS dock click), right-click shows menu
     #[cfg(target_os = "windows")]
@@ -1211,6 +1324,36 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
                 }
             });
         }
+        id if id.starts_with("toggle_vision_device_") => {
+            let monitor_id: u32 = id
+                .strip_prefix("toggle_vision_device_")
+                .unwrap()
+                .parse()
+                .unwrap_or(0);
+
+            let cached = get_vision_device_status();
+            let is_active = cached
+                .iter()
+                .find(|d| d.id == monitor_id)
+                .map(|d| !d.user_disabled)
+                .unwrap_or(true);
+
+            let api = local_api_context_from_app(&app_handle);
+            let endpoint = if is_active {
+                api.url("/vision/device/stop")
+            } else {
+                api.url("/vision/device/start")
+            };
+            tauri::async_runtime::spawn(async move {
+                let client = reqwest::Client::new();
+                let _ = api
+                    .apply_auth(client.post(endpoint))
+                    .header("Content-Type", "application/json")
+                    .body(serde_json::json!({"monitor_id": monitor_id}).to_string())
+                    .send()
+                    .await;
+            });
+        }
         id if id.starts_with("toggle_audio_device_") => {
             let device_name = id.strip_prefix("toggle_audio_device_").unwrap().to_string();
 
@@ -1378,65 +1521,7 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
         }
         "quit" => {
             debug!("Quit requested");
-
-            // Signal that this is an intentional quit so the ExitRequested
-            // handler in main.rs won't prevent it.
-            QUIT_REQUESTED.store(true, Ordering::SeqCst);
-
-            // De-dupe rapid re-clicks: a teardown is already in flight and will
-            // force-exit shortly, so don't pile another one onto the same locks.
-            if QUIT_TEARDOWN_STARTED.swap(true, Ordering::SeqCst) {
-                debug!("Quit ignored — teardown already in progress");
-                return;
-            }
-
-            // Stop recording before exiting
-            let app_handle_clone = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                info!("Stopping screenpipe recording before quit...");
-                let teardown = async {
-                    if let Some(recording_state) = app_handle_clone.try_state::<RecordingState>() {
-                        // Stop capture first (self-contained)
-                        if let Some(session) = recording_state.capture.lock().await.take() {
-                            session.stop().await;
-                        }
-                        // Then shutdown server
-                        if let Some(server) = recording_state.server.lock().await.take() {
-                            server.shutdown().await;
-                        }
-                        info!("Screenpipe server + recording stopped successfully");
-                    }
-                };
-                // Never let a wedged capture/audio shutdown block the exit: the
-                // process is dying anyway, and a stuck quit is what stranded the
-                // 2026-06-26 MacBook Air for ~57s. Force-exit once the bound elapses.
-                if tokio::time::timeout(PRE_EXIT_TEARDOWN_TIMEOUT, teardown)
-                    .await
-                    .is_err()
-                {
-                    warn!(
-                        "quit: teardown exceeded {}s (capture shutdown wedged) — force-exiting",
-                        PRE_EXIT_TEARDOWN_TIMEOUT.as_secs()
-                    );
-                }
-                info!("All tasks stopped, exiting process");
-                // Use _exit() instead of exit() to skip C++ atexit/static destructors.
-                // The whisper/ggml Metal GPU context registers a global destructor that
-                // asserts during teardown (ggml_metal_rsets_free), causing SIGABRT.
-                // We've already done our own cleanup above, so atexit handlers have
-                // nothing useful left to do.
-                #[cfg(unix)]
-                {
-                    extern "C" {
-                        fn _exit(status: i32) -> !;
-                    }
-                    unsafe {
-                        _exit(0);
-                    }
-                }
-                #[cfg(not(unix))]
-                app_handle_clone.exit(0);
-            });
+            process_exit::request_app_quit(app_handle.clone());
         }
         _ => debug!("Unhandled menu event: {:?}", event.id()),
     }

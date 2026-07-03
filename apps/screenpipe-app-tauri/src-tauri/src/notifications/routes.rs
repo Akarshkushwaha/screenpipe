@@ -235,7 +235,7 @@ pub async fn send_notification(
         "type": resolved_type,
         "title": payload.title,
         "body": body,
-        "actions": payload.actions,
+        "actions": payload.actions.clone(),
         "autoDismissMs": dismiss_ms,
         "pipe_name": source.pipe_name.clone(),
         "source_session_id": source.source_session_id.clone(),
@@ -255,6 +255,8 @@ pub async fn send_notification(
         source_url: source.source_url.clone(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         read: false,
+        // Ride along so the bell can re-offer them after the toast is gone.
+        actions: payload.actions,
     });
     emit_notification_source_marker(
         &state.app_handle,
@@ -438,6 +440,30 @@ pub async fn clear() -> Json<ApiResponse> {
         success: true,
         message: "notification history cleared".to_string(),
     })
+}
+
+/// `POST /notifications/:id/read` — mark a single notification as read.
+///
+/// Opening the bell no longer marks everything read; a notification is read
+/// only once the user actually expands it. This per-id endpoint persists that.
+pub async fn mark_one_read(Path(id): Path<String>) -> (StatusCode, Json<ApiResponse>) {
+    if store::mark_read_by_id(&id) {
+        (
+            StatusCode::OK,
+            Json(ApiResponse {
+                success: true,
+                message: "notification marked as read".to_string(),
+            }),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse {
+                success: false,
+                message: "notification not found".to_string(),
+            }),
+        )
+    }
 }
 
 /// `DELETE /notifications/:id` — dismiss a single notification.

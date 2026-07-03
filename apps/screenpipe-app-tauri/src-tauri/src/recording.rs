@@ -220,17 +220,18 @@ async fn recover_from_db_wedge(app: tauri::AppHandle, breaker: DbWedgeBreaker) {
     if let WedgeAction::GiveUp { notify } = action {
         error!(
             "db wedge auto-recovery: {} restarts within {:?} did not clear the write wedge — \
-             this looks like on-disk corruption a restart can't repair. Auto-restart suspended; \
-             quit screenpipe and run `screenpipe db recover`.",
+             in-process restarts can't fix this (poisoned WAL-index pinned by a leaked \
+             connection, or on-disk damage). Surfacing manual recovery.",
             DB_WEDGE_MAX_RESTARTS, DB_WEDGE_BREAKER_WINDOW
         );
         if notify {
-            // Publish on the event bus; the in-process `db_recovery_notifications`
-            // subscriber turns it into a notification (NOT the `/ws/events`
-            // bridge — the engine is down exactly when this fires). Deduped to
-            // once per episode by the breaker.
-            let evt = screenpipe_events::DbRecoveryEvent::needs_recovery();
-            let _ = screenpipe_events::send_event(evt.event_name(), evt);
+            // In-process restarts are proven futile for this episode. Do not
+            // surprise-relaunch the app on broad DB-shaped errors; surface a
+            // user-visible recovery state instead.
+            crate::db_relaunch::surface_manual_recovery(
+                "db wedge persisted across in-process engine restarts",
+            )
+            .await;
         }
         return;
     }
@@ -264,6 +265,11 @@ async fn recover_from_db_wedge(app: tauri::AppHandle, breaker: DbWedgeBreaker) {
         error!("db wedge auto-recovery: spawn_screenpipe failed: {}", e);
         let evt = screenpipe_events::DbRecoveryEvent::restart_failed();
         let _ = screenpipe_events::send_event(evt.event_name(), evt);
+        // A DB-init failure right after a full pool close means the WAL-index
+        // is pinned by something outside our teardown — count it toward the
+        // manual recovery threshold rather than waiting for the health
+        // watchdog to grind through more doomed respawns.
+        crate::db_relaunch::note_respawn_failure(&app, &e).await;
     }
 }
 
@@ -841,9 +847,14 @@ pub async fn spawn_screenpipe(
     //
     // A 30-minute safety ceiling prevents a wedged start from hanging the app
     // forever; for context, even a 100GB migration finishes in ~1 minute.
+    // If the phase is already "ready" but HTTP is unreachable, treat that as
+    // stale state after a short grace period. This happens when a restart dies
+    // before publishing a fresh boot phase, leaving "ready" from the previous
+    // server instance behind.
     if state.is_starting.swap(true, Ordering::SeqCst) {
         info!("Server start already in progress, waiting for boot phase...");
         const MAX_WAIT_SECS: u64 = 1800; // 30 minutes
+        const STALE_READY_TAKEOVER_SECS: u64 = 10;
         const POLL_MS: u64 = 500;
         let start_wait = std::time::Instant::now();
         loop {
@@ -863,7 +874,21 @@ pub async fn spawn_screenpipe(
             match phase.phase.as_str() {
                 "ready" => {
                     // Phase says ready — HTTP may be binding right now. Loop
-                    // once more without extra wait; it'll resolve on next poll.
+                    // briefly, but do not let stale "ready" state mask a dead
+                    // server forever.
+                    if start_wait.elapsed()
+                        > std::time::Duration::from_secs(STALE_READY_TAKEOVER_SECS)
+                    {
+                        warn!(
+                            "In-flight server start still unreachable after {}s despite boot phase=ready — taking over stale start",
+                            STALE_READY_TAKEOVER_SECS
+                        );
+                        state.is_starting.store(false, Ordering::SeqCst);
+                        if state.is_starting.swap(true, Ordering::SeqCst) {
+                            return Ok(());
+                        }
+                        break;
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
                     continue;
                 }
@@ -936,8 +961,13 @@ pub async fn spawn_screenpipe(
                         return Ok(());
                     }
                     drop(capture_guard);
-                    // Start capture on existing server
-                    return start_capture_internal(&state, &app).await;
+                    // Start capture on existing server. If this fails before
+                    // start_capture_internal reaches its success cleanup, clear
+                    // startup flags so the next retry is not wedged.
+                    let result = start_capture_internal(&state, &app).await;
+                    state.is_starting.store(false, Ordering::SeqCst);
+                    state.is_starting_capture.store(false, Ordering::SeqCst);
+                    return result;
                 }
                 _ => {
                     warn!("Server exists but not responding, will do full restart");
@@ -959,8 +989,21 @@ pub async fn spawn_screenpipe(
         }
     }
 
-    // Kill orphaned processes
-    kill_process_on_port(port).await;
+    // Kill orphaned processes. Bound the cleanup so a hung OS helper cannot
+    // leak `is_starting=true` and wedge future restarts behind the
+    // "start already in progress" guard.
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        kill_process_on_port(port),
+    )
+    .await
+    .is_err()
+    {
+        warn!(
+            "Timed out while killing orphaned process(es) on port {}; continuing with port-release wait",
+            port
+        );
+    }
 
     // Wait for port release
     let max_poll_iters = if cfg!(windows) { 40 } else { 20 };
@@ -1178,6 +1221,8 @@ pub async fn spawn_screenpipe(
     match result_rx.await {
         Ok(Ok(())) => {
             info!("Screenpipe started successfully");
+            state.is_starting.store(false, Ordering::SeqCst);
+            state.is_starting_capture.store(false, Ordering::SeqCst);
             let spawn_epoch = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1195,6 +1240,7 @@ pub async fn spawn_screenpipe(
         }
         Err(_) => {
             state.is_starting.store(false, Ordering::SeqCst);
+            state.is_starting_capture.store(false, Ordering::SeqCst);
             Err("Server startup channel dropped unexpectedly".to_string())
         }
     }

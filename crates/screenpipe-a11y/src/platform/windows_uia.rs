@@ -499,6 +499,9 @@ impl UiaContext {
             description: None,
             automation_id,
             bounds,
+            // Windows ancestor-chain capture not implemented yet — macOS only
+            // for now (see collect_ancestor_chain in platform/macos.rs).
+            ancestors: None,
         }
     }
 

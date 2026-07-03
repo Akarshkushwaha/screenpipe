@@ -748,6 +748,20 @@ export function PrivacySection() {
     );
   };
 
+  // Secrets-only scrub of coding-agent (pi) session logs at rest. Distinct
+  // from the screen/audio PII workers above: agents persist full sessions
+  // (bash output, tool args) unredacted, so credentials land in plaintext on
+  // disk. Regex secrets-only + on-device; opt-in, default off.
+  const redactAgentSessionSecrets = Boolean(
+    settings.redactAgentSessionSecrets ?? false,
+  );
+  const handleAgentLogRedactionToggle = (checked: boolean) => {
+    handleSettingsChange(
+      { redactAgentSessionSecrets: checked } as Partial<Settings>,
+      true,
+    );
+  };
+
   // WHICH captured columns get scrubbed (orthogonal to the categories
   // above). Typed text / clipboard / transcripts / window titles /
   // on-screen text are always redacted; these extra surfaces are opt-in.
@@ -769,6 +783,9 @@ export function PrivacySection() {
   // lives. Kept OUT of CORE so the user can still uncheck it — it only
   // seeds the default. Keep in sync with the Rust defaults
   // (`RedactColumns::default` / `default_pii_redaction_columns`).
+  // (Per-word OCR `text_json` is NOT a column here — it's a structured copy
+  // of on-screen text, always redacted with full_text on the engine side;
+  // issue #4117.)
   const DEFAULT_OPTIONAL_COLUMNS = ["element_properties"];
   const PII_COLUMN_OPTIONS: {
     value: string;
@@ -1671,6 +1688,37 @@ export function PrivacySection() {
         </Card>
       </div>
       </LockedSetting>
+
+      <div className="space-y-2">
+        <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">
+          Agent logs
+        </h2>
+
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <label className="flex items-start gap-2 text-xs cursor-pointer">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={redactAgentSessionSecrets}
+                onChange={(e) => handleAgentLogRedactionToggle(e.target.checked)}
+              />
+              <span>
+                <span className="font-medium text-foreground">
+                  Redact secrets in agent logs
+                </span>
+                <span className="text-muted-foreground">
+                  {" "}— coding agents (Pi) save full sessions, including any
+                  passwords, API keys, or tokens they touch, in plaintext on
+                  disk. When on, a background worker strips secrets from idle
+                  agent session logs. Secrets-only and on-device; never rewrites
+                  a session a run is still using.
+                </span>
+              </span>
+            </label>
+          </CardContent>
+        </Card>
+      </div>
 
       <div className="space-y-2">
         <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">

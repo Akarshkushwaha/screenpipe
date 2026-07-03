@@ -119,7 +119,7 @@ pub async fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 // Re-export types from route modules for backward compatibility
 pub use crate::routes::content::{ContentItem, PaginatedResponse};
 pub use crate::routes::health::{HealthCheckResponse, MonitorInfo};
-pub use crate::routes::search::SearchResponse;
+pub use crate::routes::search::{SearchCacheEntry, SearchResponse};
 
 // Re-export handlers that are referenced from lib.rs
 pub use crate::routes::health::{
@@ -129,7 +129,7 @@ pub use crate::routes::health::{
 pub type FrameImageCache = LruCache<i64, (String, std::time::Instant)>;
 
 /// Cache key for search results (hash of query parameters)
-pub type SearchCache = MokaCache<u64, Arc<SearchResponse>>;
+pub type SearchCache = MokaCache<u64, Arc<SearchCacheEntry>>;
 
 pub struct AppState {
     pub db: Arc<DatabaseManager>,
@@ -210,6 +210,10 @@ pub struct AppState {
     /// configuration that doesn't run vision capture (e.g. headless
     /// `--disable-vision`).
     pub high_fps_controller: Option<Arc<crate::high_fps_controller::HighFpsController>>,
+    /// Shared VisionManager so the `/vision/device/*` routes can pause/resume
+    /// individual monitors. Updated at runtime when the desktop app's
+    /// CaptureSession starts/stops; set once at boot for the CLI engine.
+    pub vision_manager: Arc<ArcSwap<Option<Arc<crate::vision_manager::VisionManager>>>>,
 }
 
 pub struct SCServer {
@@ -262,6 +266,10 @@ pub struct SCServer {
     /// Shared high-FPS controller. Set before `start()` so AppState and
     /// the per-monitor capture loops point at the same instance.
     pub high_fps_controller: Option<Arc<crate::high_fps_controller::HighFpsController>>,
+    /// Handle to the active VisionManager. CaptureSession registers its
+    /// instance here on start and clears on stop so `/vision/device/*` hits
+    /// the manager that is actually capturing.
+    pub vision_manager: Arc<ArcSwap<Option<Arc<crate::vision_manager::VisionManager>>>>,
     /// When true, the timeline / rewind feature is disabled. The server skips
     /// warming the hot frame cache from the DB at startup (the cache is only
     /// read by the timeline streaming endpoint). Set before `start()`.
@@ -305,6 +313,7 @@ fn is_api_auth_exempt_path(path: &str) -> bool {
     path == "/health"
         || path == "/ws/health"
         || path == "/audio/device/status"
+        || path == "/vision/device/status"
         || path == "/connections/oauth/callback"
         || (path.starts_with("/mcp-servers/") && path.ends_with("/oauth/callback"))
         || path == "/connections/browser/pair/start"
@@ -352,6 +361,7 @@ impl SCServer {
             oauth_refresher: None,
             external_memory_sync: None,
             high_fps_controller: None,
+            vision_manager: Arc::new(ArcSwap::from_pointee(None)),
             timeline_disabled: false,
             advertise_mdns: should_advertise_mdns(addr),
         }
@@ -629,10 +639,12 @@ impl SCServer {
                 NonZeroUsize::new(1000).unwrap(),
             )))),
             ws_connection_count: Arc::new(AtomicUsize::new(0)),
-            // Search cache: 1000 entries, 60 second TTL
+            // Search cache: short-lived and intentionally small. Search payloads
+            // can contain large OCR/audio text blobs; the route also skips
+            // caching oversized responses before they reach this cache.
             search_cache: MokaCache::builder()
-                .max_capacity(1000)
-                .time_to_live(Duration::from_secs(60))
+                .max_capacity(128)
+                .time_to_live(Duration::from_secs(30))
                 .build(),
             use_pii_removal: self.use_pii_removal,
             // Cloud search client (disabled by default, can be enabled via API)
@@ -676,6 +688,7 @@ impl SCServer {
             cloud_token: self.cloud_token.clone(),
             secret_store: self.secret_store.clone(),
             high_fps_controller: self.high_fps_controller.clone(),
+            vision_manager: self.vision_manager.clone(),
         });
 
         // Populate the registry so /connections/browsers shows both kinds
@@ -767,6 +780,18 @@ impl SCServer {
             .post("/audio/device/start", start_audio_device)
             .post("/audio/device/stop", stop_audio_device)
             .get("/audio/device/status", audio_device_status)
+            .post(
+                "/vision/device/start",
+                crate::routes::vision::start_vision_device,
+            )
+            .post(
+                "/vision/device/stop",
+                crate::routes::vision::stop_vision_device,
+            )
+            .get(
+                "/vision/device/status",
+                crate::routes::vision::vision_device_status,
+            )
             .get("/elements", search_elements)
             .get("/frames/:frame_id/elements", get_frame_elements)
             .get("/activity-summary", get_activity_summary)

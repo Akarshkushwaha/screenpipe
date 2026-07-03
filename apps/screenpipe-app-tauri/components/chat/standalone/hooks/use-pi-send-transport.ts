@@ -83,11 +83,13 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
   const { handleStop, openConnectionSetup } = usePiLiveSendControls({
     abortControllerRef,
     activePipeExecution,
+    cancelStreamingMessageRender,
     piActiveStopRequestedRef,
     piContentBlocksRef,
     piMessageIdRef,
     piSessionIdRef,
     piStreamingTextRef,
+    setMessages,
     setIsLoading,
     setIsStreaming,
   });

@@ -189,6 +189,26 @@ fn check_screen_locked_cgsession() -> bool {
     }
 }
 
+/// Shared handling for a screen-unlock transition.
+///
+/// Invalidates persistent SCStream handles so the capture loop recreates them
+/// with fresh frames, AND arms the permission-monitor wake grace. The grace is
+/// the load-bearing part: re-creating an SCStream transiently reports `denied`
+/// before ScreenCaptureKit re-registers, which the eager permission detector
+/// would otherwise surface as a spurious `permission_lost`. That false positive
+/// is the dominant cause of the recurring screen-recording permission-loss
+/// telemetry — users lock/unlock several times a day. System *wake* already
+/// arms this grace via [`mark_recently_woke`]; unlock did not, until now.
+///
+/// Also wakes any `monitor_watcher` parked on [`SCREEN_UNLOCK_NOTIFY`] so it
+/// re-scans immediately instead of waiting for its poll tick.
+#[cfg(target_os = "macos")]
+fn handle_screen_unlock_transition() {
+    screenpipe_screen::stream_invalidation::request();
+    crate::permission_monitor::notify_wake();
+    SCREEN_UNLOCK_NOTIFY.notify_one();
+}
+
 /// Start the sleep/wake monitor on macOS
 /// This sets up NSWorkspace notification observers for sleep and wake events,
 /// plus a polling thread that checks `CGSessionCopyCurrentDictionary` every
@@ -283,12 +303,11 @@ pub fn start_sleep_monitor() {
             let was_locked = SCREEN_IS_LOCKED.swap(false, Ordering::SeqCst);
             screenpipe_config::set_screen_locked(false);
             if was_locked {
-                // State change logged via safety-net poll below if needed.
-                // Request invalidation of persistent SCStream handles so
-                // the capture loop recreates them with fresh frames.
-                #[cfg(target_os = "macos")]
-                screenpipe_screen::stream_invalidation::request();
-                SCREEN_UNLOCK_NOTIFY.notify_one();
+                // Recreate the SCStream with fresh frames AND arm the
+                // permission-monitor grace (re-creation transiently reports
+                // `denied`). catch_unwind: never let a panic unwind across the
+                // C boundary — this runs in a CFNotificationCenter callback.
+                let _ = std::panic::catch_unwind(handle_screen_unlock_transition);
             }
         }
 
@@ -348,9 +367,7 @@ pub fn start_sleep_monitor() {
                 info!("Screen locked (CGSession safety-net poll)");
             } else {
                 info!("Screen unlocked (CGSession safety-net poll)");
-                #[cfg(target_os = "macos")]
-                screenpipe_screen::stream_invalidation::request();
-                SCREEN_UNLOCK_NOTIFY.notify_one();
+                handle_screen_unlock_transition();
             }
         }
     });
@@ -396,6 +413,11 @@ pub fn start_sleep_monitor() {
             #[cfg(target_os = "macos")]
             screenpipe_screen::stream_invalidation::request();
             screenpipe_audio::stream_invalidation::request();
+            // SCStream re-creation after a reconfiguration transiently reports
+            // `denied`; arm the permission-monitor grace so it isn't surfaced
+            // as a false permission_lost. catch_unwind: never unwind across the
+            // C boundary (this runs in a CGDisplay reconfiguration callback).
+            let _ = std::panic::catch_unwind(crate::permission_monitor::notify_wake);
             // Wake any waiters (e.g. monitor_watcher) so they re-scan the
             // monitor list immediately instead of waiting on a poll timer.
             DISPLAY_RECONFIG_NOTIFY.notify_one();
@@ -531,9 +553,7 @@ fn on_did_wake(handle: &tokio::runtime::Handle) {
         screenpipe_config::set_screen_locked(locked);
         if was_locked && !locked {
             info!("Screen unlocked after wake (CGSession safety-net cleared SCREEN_IS_LOCKED)");
-            #[cfg(target_os = "macos")]
-            screenpipe_screen::stream_invalidation::request();
-            SCREEN_UNLOCK_NOTIFY.notify_one();
+            handle_screen_unlock_transition();
         }
 
         // Resume DB write queue now that the system is stable.
@@ -678,8 +698,26 @@ pub fn start_sleep_monitor() {
 mod tests {
     use super::*;
 
+    /// `RECENTLY_WOKE` / `RECENTLY_WOKE_SEQ` are process-global, and
+    /// `mark_recently_woke` arms them with a 30s-delayed clear thread. Tests
+    /// that touch them must hold this lock so they can't interleave under the
+    /// parallel test runner.
+    static RECENTLY_WOKE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Neutralize any pending delayed clear (by bumping the seq) and reset the
+    /// flag, giving the caller a clean baseline regardless of what earlier
+    /// tests left behind.
+    fn reset_recently_woke() {
+        RECENTLY_WOKE_SEQ.fetch_add(1, Ordering::SeqCst);
+        RECENTLY_WOKE.store(false, Ordering::SeqCst);
+    }
+
     #[test]
     fn test_recently_woke_flag() {
+        let _guard = RECENTLY_WOKE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_recently_woke();
         assert!(!recently_woke_from_sleep());
         RECENTLY_WOKE.store(true, Ordering::SeqCst);
         assert!(recently_woke_from_sleep());
@@ -689,6 +727,12 @@ mod tests {
 
     #[test]
     fn test_screen_is_locked_flag() {
+        // SCREEN_IS_LOCKED is process-global and the capture path mirrors the
+        // REAL machine lock state into it (event_driven_capture stores true
+        // when it resolves loginwindow as the frontmost app). Running the
+        // suite while the screen is actually locked leaves it armed — reset
+        // for a hermetic baseline.
+        SCREEN_IS_LOCKED.store(false, Ordering::SeqCst);
         assert!(!screen_is_locked());
         SCREEN_IS_LOCKED.store(true, Ordering::SeqCst);
         assert!(screen_is_locked());
@@ -792,10 +836,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn test_on_did_wake_sets_audio_invalidation() {
+        let _guard = RECENTLY_WOKE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Clear stale flags
         let _ = screenpipe_audio::stream_invalidation::take();
         let _ = screenpipe_screen::stream_invalidation::take();
-        RECENTLY_WOKE.store(false, Ordering::SeqCst);
+        reset_recently_woke();
 
         let handle = tokio::runtime::Handle::current();
         on_did_wake(&handle);
@@ -816,6 +863,24 @@ mod tests {
         assert!(
             !screenpipe_audio::stream_invalidation::take(),
             "Audio flag should be cleared after take()"
+        );
+
+        // Don't leak the armed flag (and its pending 30s clear thread) to
+        // whatever test runs next.
+        reset_recently_woke();
+    }
+
+    /// A screen-unlock transition must arm the permission-monitor wake grace,
+    /// so the SCStream re-creation it triggers does not surface as a spurious
+    /// `permission_lost`. This is the #1 cause of recurring screen-recording
+    /// permission-loss telemetry (users lock/unlock several times a day).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_screen_unlock_arms_permission_wake_grace() {
+        handle_screen_unlock_transition();
+        assert!(
+            crate::permission_monitor::wake_grace_active(),
+            "screen unlock must arm the permission-monitor wake grace"
         );
     }
 

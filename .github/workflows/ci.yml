@@ -37,23 +37,33 @@ jobs:
       RUSTFLAGS: "-C link-arg=-Wl,--allow-multiple-definition"
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
           override: true
-          cache: true
+          # The explicit rust-cache step below is the single cache layer.
+          # cache: true ran Swatinem/rust-cache a second time next to the
+          # plain actions/cache this replaced — two ~1 GB saves of the same
+          # artifacts per run, which fed the repo-wide cache eviction
+          # (>20 GB active vs GitHub's 10 GB limit) that kept every Rust CI
+          # restore cold.
+          cache: false
           rustflags: ""
+
+      - name: Rust cache
+        # Replaces actions/cache keyed exactly on hashFiles(Cargo.lock) with
+        # no restore-keys — any lockfile bump meant a fully cold 20+ min
+        # build. rust-cache falls back to the closest previous cache on a
+        # prefix match, so only changed deps rebuild. Restore/save is an
+        # optimization only; a transient GHA cache service error must never
+        # fail the job (same rationale as e2e-test.yml).
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-test-ubuntu
+          cache-bin: false
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -78,12 +88,6 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~\AppData\Local\cargo\
-            target\
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -100,8 +104,22 @@ jobs:
         with:
           toolchain: stable
           override: true
-          cache: true
+          # See test-ubuntu: the explicit rust-cache step below is the
+          # single cache layer; cache: true would save a duplicate.
+          # The removed actions/cache here was doubly broken — its
+          # ~\AppData\Local\cargo\ path isn't CARGO_HOME on GitHub
+          # runners (that's ~\.cargo), so the registry half cached junk.
+          cache: false
           rustflags: ""
+
+      - name: Rust cache
+        # See test-ubuntu — prefix-fallback restore, single cache layer,
+        # never fail the job on a cache service error.
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-test-windows
+          cache-bin: false
 
       - name: setup Bun
         uses: oven-sh/setup-bun@v2
@@ -112,7 +130,7 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Ensure 7-Zip is available
-        shell: powershell
+        shell: pwsh
         run: |
           # GitHub-hosted windows runners ship 7-Zip pre-installed, so this is
           # normally a no-op. Only download when it's genuinely missing, and
@@ -171,14 +189,15 @@ jobs:
       # exits with STATUS_DLL_NOT_FOUND (0xc0000135) on the first
       # ort::api() call — which is exactly what test_process_ocr_task_windows
       # hits inside accuracy_test. Stage them before any cargo test that
-      # touches ort. Run this once for both --release/--target builds —
-      # cargo test --release --target x86_64-pc-windows-msvc puts test
-      # binaries under target/x86_64-pc-windows-msvc/release/deps/.
+      # touches ort. Run this once for all --profile release-dev/--target
+      # builds — cargo test --profile release-dev --target
+      # x86_64-pc-windows-msvc puts test binaries under
+      # target/x86_64-pc-windows-msvc/release-dev/deps/.
       - name: Stage ONNX Runtime DLLs next to test binary
         shell: pwsh
         run: |
           $src = "${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.24.2/lib"
-          $dst = "${{ github.workspace }}/target/x86_64-pc-windows-msvc/release/deps"
+          $dst = "${{ github.workspace }}/target/x86_64-pc-windows-msvc/release-dev/deps"
           if (-not (Test-Path $dst)) {
             New-Item -ItemType Directory -Path $dst -Force | Out-Null
           }
@@ -252,7 +271,11 @@ jobs:
           # above still provides the runtime DLL.
           # Use prebuilt NASM objects on Windows: https://aws.github.io/aws-lc-rs/requirements/windows.html#prebuilt-nasm-objects
           AWS_LC_SYS_PREBUILT_NASM: "1"
-        run: cargo test -p screenpipe-screen test_process_ocr_task_windows --release --target x86_64-pc-windows-msvc
+        # --profile release-dev, not --release: the release profile is the
+        # shipping profile (fat LTO, codegen-units=1) — pointlessly slow
+        # codegen for tests. release-dev (thin LTO, 16 codegen units, same
+        # opt-level) exists exactly for this; see root Cargo.toml.
+        run: cargo test -p screenpipe-screen test_process_ocr_task_windows --profile release-dev --target x86_64-pc-windows-msvc
 
       - name: Run PII removal tests
         env:
@@ -265,7 +288,8 @@ jobs:
           # above still provides the runtime DLL.
           # Use prebuilt NASM objects on Windows: https://aws.github.io/aws-lc-rs/requirements/windows.html#prebuilt-nasm-objects
           AWS_LC_SYS_PREBUILT_NASM: "1"
-        run: cargo test -p screenpipe-core pii_removal --release --target x86_64-pc-windows-msvc
+        # release-dev, not release — see the OCR test step above.
+        run: cargo test -p screenpipe-core pii_removal --profile release-dev --target x86_64-pc-windows-msvc
 
       - name: Run PII redaction tests
         env:
@@ -278,31 +302,43 @@ jobs:
           # above still provides the runtime DLL.
           # Use prebuilt NASM objects on Windows: https://aws.github.io/aws-lc-rs/requirements/windows.html#prebuilt-nasm-objects
           AWS_LC_SYS_PREBUILT_NASM: "1"
-        run: cargo test -p screenpipe-engine --lib pii_redaction_tests --release --target x86_64-pc-windows-msvc
+        # release-dev, not release — see the OCR test step above.
+        run: cargo test -p screenpipe-engine --lib pii_redaction_tests --profile release-dev --target x86_64-pc-windows-msvc
 
       # pipes_test removed — pipe manager system deleted in #2212
 
   test-macos:
-    runs-on: macos-latest
+    # Pinned off `macos-latest`: that label rolled to the Xcode 26.5 image whose
+    # clang toolchain is missing `clang_rt.osx`, so `cargo test`'s debug link
+    # fails with `ld: library 'clang_rt.osx' not found` (green on the 3 prior
+    # commits, then red on the next 2 with no related code change). macos-14
+    # (Sonoma) has a complete toolchain and is proven here — e2e-macos.yml builds
+    # screenpipe-screen on it and passes. Revisit when macos-latest is fixed.
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
           override: true
-          cache: true
+          # See test-ubuntu: the explicit rust-cache step below is the
+          # single cache layer; cache: true would save a duplicate.
+          cache: false
           rustflags: ""
+
+      - name: Rust cache
+        # See test-ubuntu — prefix-fallback restore, single cache layer,
+        # never fail the job on a cache service error. cache-bin: false
+        # also stops restoring a stale ~/.cargo/bin over the toolchain,
+        # the failure mode the "Verify Rust toolchain" step below guards
+        # against.
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-test-macos
+          cache-bin: false
 
       - name: Verify Rust toolchain
         shell: bash

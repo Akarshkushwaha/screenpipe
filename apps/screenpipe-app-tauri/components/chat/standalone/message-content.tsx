@@ -6,7 +6,7 @@
 import * as React from "react";
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { Calendar, ChevronDown, ChevronUp, Plug, RefreshCw } from "lucide-react";
+import { Check, Calendar, ChevronDown, ChevronRight, ChevronUp, Plug, RefreshCw } from "lucide-react";
 import { SourceCitationFooter } from "@/components/chat/source-citation-footer";
 import { MarkdownBlock } from "@/components/chat/markdown-block";
 import { getFaviconUrl } from "@/components/rewind/timeline/favicon-utils";
@@ -15,7 +15,9 @@ import { useSettings } from "@/lib/hooks/use-settings";
 import { useFeedbackStore } from "@/lib/stores/feedback-store";
 import { cn } from "@/lib/utils";
 import type { Message, ToolCall, ContentBlock } from "@/lib/chat/types";
-import { formatWorkDuration } from "@/lib/chat/message-rendering";
+import type { ConnectionListItem } from "@/lib/chat/connection-suggestions";
+import type { InlineConnectStatus } from "@/lib/connections/inline-connect";
+import { formatDurationParts, formatStoppedWorkDuration, formatWorkDuration } from "@/lib/chat/message-rendering";
 import {
   classifyCurl,
   endpointFamily,
@@ -135,10 +137,12 @@ export function GridDissolveLoader({
             className={cn(
               "transition-colors duration-100",
               on
-                ? phase === "streaming"
+                ? phase === "streaming" || phase === "analyzing"
                   ? "bg-foreground/40"
                   : "bg-foreground"
-                : "bg-border/30"
+                : phase === "streaming" || phase === "analyzing"
+                  ? "bg-border/20"
+                  : "bg-border/30"
             )}
             style={{ width: 5, height: 5 }}
           />
@@ -780,6 +784,7 @@ function AppStatsBlock({ content }: { content: string }) {
 type GroupedBlock =
   | { type: "text"; text: string; key: number }
   | { type: "thinking"; text: string; isThinking: boolean; durationMs?: number; key: number }
+  | { type: "connection-action"; block: Extract<ContentBlock, { type: "connection_action" }>; key: number }
   | { type: "tool-group"; toolCalls: ToolCall[]; key: number }
   | { type: "work-group"; toolCalls: ToolCall[]; durationMs: number; key: number };
 
@@ -800,6 +805,8 @@ function groupContentBlocks(blocks: ContentBlock[]): GroupedBlock[] {
         result.push({ type: "text", text: block.text, key: result.length });
       } else if (block.type === "thinking") {
         result.push({ type: "thinking", text: block.text, isThinking: block.isThinking, durationMs: block.durationMs, key: result.length });
+      } else if (block.type === "connection_action") {
+        result.push({ type: "connection-action", block, key: result.length });
       }
     }
   }
@@ -877,90 +884,301 @@ function collapseHiddenWorkGroups(grouped: GroupedBlock[], hideThinkingBlocks: b
   return out;
 }
 
-// Build natural-language summary of completed tool calls
-function buildToolSummary(toolCalls: ToolCall[]): string {
-  const counts: Record<string, number> = {};
-  for (const tc of toolCalls) {
-    const action = tc.toolName === "bash" ? "ran" : tc.toolName === "read" ? "read" : tc.toolName === "edit" ? "edited" : tc.toolName === "write" ? "wrote" : tc.toolName === "grep" ? "searched" : tc.toolName;
-    counts[action] = (counts[action] || 0) + 1;
-  }
-  const parts = Object.entries(counts).map(([action, count]) => {
-    if (action === "read") return `read ${count} file${count > 1 ? "s" : ""}`;
-    if (action === "edited") return `edited ${count} file${count > 1 ? "s" : ""}`;
-    if (action === "wrote") return `wrote ${count} file${count > 1 ? "s" : ""}`;
-    if (action === "ran") return `ran ${count} command${count > 1 ? "s" : ""}`;
-    if (action === "searched") return `${count} search${count > 1 ? "es" : ""}`;
-    return `${count} ${action}`;
-  });
-  return parts.join(", ");
+function InlineConnectionActionCard({
+  block,
+  connected,
+  onConnect,
+  onContinue,
+  onDismiss,
+}: {
+  block: Extract<ContentBlock, { type: "connection_action" }>;
+  connected: boolean;
+  onConnect: () => Promise<InlineConnectStatus | void> | InlineConnectStatus | void;
+  onContinue?: (prompt: string, label?: string) => void | Promise<void>;
+  onDismiss: () => void;
+}) {
+  const [connectState, setConnectState] = useState<"idle" | "waiting" | "error">("idle");
+  const [locallyConnected, setLocallyConnected] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const effectiveConnected = connected || locallyConnected;
+  const connectLabel = effectiveConnected ? `${block.connectionName} connected` : `connect ${block.connectionName}`;
+  const continueLabel = block.pendingActionLabel ?? `continue with ${block.connectionName}`;
+  const continuePrompt = block.pendingActionPrompt ??
+    `${block.connectionName} is connected now. Continue the action we were discussing, but ask me for confirmation before writing to ${block.connectionName}.`;
+  const isPiGate = Boolean(block.extensionRequestId);
+
+  const handleConnect = async () => {
+    setConnectState("waiting");
+    setStatusMessage("opening authorization in your browser...");
+    try {
+      const result = await onConnect();
+      if (result?.status === "error") {
+        setConnectState("error");
+        setStatusMessage(result.reason);
+        return;
+      }
+      if (result?.status === "unsupported") {
+        setConnectState("error");
+        setStatusMessage(result.reason);
+        return;
+      }
+      if (result?.status === "connected") {
+        setLocallyConnected(true);
+        setStatusMessage("connected");
+      }
+    } finally {
+      setTimeout(() => {
+        setConnectState("idle");
+        setStatusMessage(null);
+      }, 1600);
+    }
+  };
+
+  return (
+    <div className="w-full max-w-xl border border-border bg-background p-3 font-mono">
+      <div className="flex items-start gap-3">
+        <div className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center">
+          {effectiveConnected ? (
+            <Check className="h-4 w-4" strokeWidth={2} aria-hidden />
+          ) : (
+            <IntegrationIcon
+              icon={block.icon || block.connectionId}
+              className="h-4 w-4 flex items-center justify-center"
+              fallbackClassName="h-4 w-4 text-foreground"
+            />
+          )}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-semibold leading-5 text-foreground">
+            {connectLabel}
+          </div>
+          <div className="mt-1 max-w-md text-xs leading-5 text-muted-foreground">
+            {statusMessage ?? block.extensionReason ?? "token stays in the local secret store and is never shown to the model."}
+          </div>
+          {effectiveConnected && isPiGate ? (
+            <div className="mt-3 text-xs uppercase tracking-wide text-muted-foreground">
+              continuing...
+            </div>
+          ) : effectiveConnected ? (
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => onContinue?.(continuePrompt, continueLabel)}
+                className="border border-foreground bg-foreground px-2.5 py-1.5 text-xs uppercase tracking-wide text-background transition-colors duration-150"
+              >
+                {continueLabel}
+              </button>
+              <button
+                type="button"
+                onClick={onDismiss}
+                className="border border-border px-2.5 py-1.5 text-xs uppercase tracking-wide text-muted-foreground transition-colors duration-150 hover:bg-foreground hover:text-background"
+              >
+                dismiss
+              </button>
+            </div>
+          ) : (
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={handleConnect}
+                disabled={connectState === "waiting"}
+                className="border border-foreground bg-foreground px-2.5 py-1.5 text-xs uppercase tracking-wide text-background transition-opacity duration-150 disabled:opacity-60"
+              >
+                {connectState === "waiting" ? "waiting" : connectState === "error" ? "retry" : "connect"}
+              </button>
+              <button
+                type="button"
+                onClick={onDismiss}
+                className="border border-border px-2.5 py-1.5 text-xs uppercase tracking-wide text-muted-foreground transition-colors duration-150 hover:bg-foreground hover:text-background"
+              >
+                not now
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function toolCallRenderKey(toolCall: ToolCall, index: number): string {
   return `${toolCall.id || toolCall.toolName || "tool"}:${index}`;
 }
 
+function toolWorkStartedAt(toolCalls: ToolCall[], fallbackStartedAtMs?: number): number | undefined {
+  const starts = toolCalls
+    .map((toolCall) => toolCall.startedAtMs)
+    .filter((startedAtMs): startedAtMs is number => typeof startedAtMs === "number" && Number.isFinite(startedAtMs));
+  if (starts.length > 0) return Math.min(...starts);
+  return fallbackStartedAtMs;
+}
+
+function toolWorkEndedAt(toolCalls: ToolCall[]): number | undefined {
+  const ends = toolCalls
+    .map((toolCall) => toolCall.endedAtMs)
+    .filter((endedAtMs): endedAtMs is number => typeof endedAtMs === "number" && Number.isFinite(endedAtMs));
+  if (ends.length > 0) return Math.max(...ends);
+  return undefined;
+}
+
+function formatRunningWorkDuration(startedAtMs: number): string {
+  const durationMs = Date.now() - startedAtMs;
+  return durationMs >= 1000 ? `Working for ${formatDurationParts(durationMs)}` : "Working";
+}
+
+function completedWorkSummaryFromRunning(runningSummary: string): string {
+  const prefix = "Working for ";
+  if (runningSummary.startsWith(prefix)) {
+    return `Worked for ${runningSummary.slice(prefix.length)}`;
+  }
+  return "Worked";
+}
+
+function WorkSummaryText({
+  text,
+  animateRunningDuration,
+}: {
+  text: string;
+  animateRunningDuration: boolean;
+}) {
+  const prefix = "Working";
+
+  if (!animateRunningDuration || !text.startsWith(prefix)) {
+    return <>{text}</>;
+  }
+
+  const durationSuffix = text.slice(prefix.length);
+
+  return (
+    <>
+      {prefix}
+      <AnimatePresence initial={false}>
+        {durationSuffix && (
+          <motion.span
+            key="running-duration"
+            initial={{ opacity: 0, y: 2 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -2 }}
+            transition={{ duration: 0.16, ease: "easeOut" }}
+            className="inline-block whitespace-pre"
+          >
+            {durationSuffix}
+          </motion.span>
+        )}
+      </AnimatePresence>
+    </>
+  );
+}
+
+function WorkStatusHeader({ label }: { label: string }) {
+  return (
+    <div className="w-full min-w-0">
+      <div className="py-1 text-xs font-mono text-foreground/50">
+        {label}
+      </div>
+      <div className="w-full min-w-full border-t border-border/50" />
+    </div>
+  );
+}
+
 function ToolCallGroup({
   toolCalls,
   defaultExpanded = false,
+  isGenerating = false,
+  preferSummaryOverride = false,
   summaryOverride,
-  hideCount = false,
+  workStartedAtMs,
 }: {
   toolCalls: ToolCall[];
   defaultExpanded?: boolean;
+  isGenerating?: boolean;
+  preferSummaryOverride?: boolean;
   summaryOverride?: string;
-  hideCount?: boolean;
+  workStartedAtMs?: number;
 }) {
   const [manualExpand, setManualExpand] = useState<boolean | null>(null);
+  const [runningSummary, setRunningSummary] = useState("Working");
+  const [completedLiveSummary, setCompletedLiveSummary] = useState<string | null>(null);
+  const wasWorkingRef = useRef(false);
 
-  const hasRunning = toolCalls.some((tc) => tc.isRunning);
+  const hasRunningTool = toolCalls.some((tc) => tc.isRunning);
+  const isWorking = hasRunningTool || isGenerating;
   const hasError = toolCalls.some((tc) => tc.isError);
-  const allDone = !hasRunning;
-  const doneCount = toolCalls.filter((tc) => !tc.isRunning).length;
+  const allDone = !isWorking;
   const total = toolCalls.length;
-  const summary = allDone ? (summaryOverride || buildToolSummary(toolCalls)) : "";
+  const startedAtMs = toolWorkStartedAt(toolCalls, workStartedAtMs);
+  const endedAtMs = allDone ? toolWorkEndedAt(toolCalls) : undefined;
+  const completedDurationMs = startedAtMs && endedAtMs ? Math.max(1, endedAtMs - startedAtMs) : undefined;
+  const justCompletedSummary = !isWorking && wasWorkingRef.current
+    ? completedWorkSummaryFromRunning(runningSummary)
+    : null;
+  const summary = allDone
+    ? (
+        preferSummaryOverride && summaryOverride
+          ? summaryOverride
+          : justCompletedSummary ||
+            completedLiveSummary ||
+            (completedDurationMs ? formatWorkDuration(completedDurationMs) : (summaryOverride || "Worked"))
+      )
+    : "";
+
+  useEffect(() => {
+    if (!isWorking || !startedAtMs) {
+      setRunningSummary("Working");
+      return;
+    }
+    const updateSummary = () => setRunningSummary(formatRunningWorkDuration(startedAtMs));
+    updateSummary();
+    const id = window.setInterval(updateSummary, 1000);
+    return () => window.clearInterval(id);
+  }, [isWorking, startedAtMs]);
+
+  useEffect(() => {
+    if (isWorking) {
+      wasWorkingRef.current = true;
+      setCompletedLiveSummary(null);
+      return;
+    }
+    if (wasWorkingRef.current) {
+      setCompletedLiveSummary(completedWorkSummaryFromRunning(runningSummary));
+      wasWorkingRef.current = false;
+    }
+  }, [isWorking, runningSummary]);
 
   // Auto-expand while running, auto-collapse when done (user can override).
   // `defaultExpanded` keeps the group open even when done — used for
   // messages whose entire output is tool calls (typical pipe-runs)
   // where the tool result is the whole story.
-  const isExpanded = manualExpand !== null ? manualExpand : (hasRunning || defaultExpanded);
+  const isExpanded = manualExpand !== null ? manualExpand : (hasRunningTool || defaultExpanded);
 
   return (
-    <div className="w-full min-w-0">
-      {/* Header bar — clickable to toggle */}
-      <button
-        onClick={() => setManualExpand(isExpanded ? false : true)}
-        className="w-full flex items-center gap-2 py-1 text-left min-w-0 group"
-      >
-        {/* Status indicator */}
-        {!hideCount && hasRunning && (
-          <span className="flex-shrink-0 text-xs font-mono text-foreground/40">
-            <motion.span
-              className="inline-block"
-              animate={{ opacity: [1, 1, 0.3, 0.3, 1] }}
-              transition={{ duration: 1, repeat: Infinity, times: [0, 0.25, 0.25, 0.75, 0.75], ease: "linear" }}
-            >
-              [{doneCount}/{total}]
-            </motion.span>
+    <div className="w-full min-w-0 self-stretch">
+      <div className="mb-2 w-full min-w-full">
+        {/* Header bar — clickable to toggle */}
+        <button
+          onClick={() => setManualExpand(isExpanded ? false : true)}
+          className="w-full flex items-center gap-1.5 py-1 text-left min-w-0 group cursor-pointer"
+        >
+          {/* Summary text */}
+          <span className="truncate text-xs font-mono text-foreground/50 group-hover:text-foreground/80 transition-colors duration-150">
+            <WorkSummaryText
+              text={isWorking ? runningSummary : summary || `${total} steps`}
+              animateRunningDuration={isWorking}
+            />
+            {hasError && allDone && (
+              <span className="ml-1.5 text-foreground/30">· {toolCalls.filter(tc => tc.isError).length} failed</span>
+            )}
           </span>
-        )}
 
-        {/* Summary text */}
-        <span className="truncate flex-1 text-xs font-mono text-foreground/50 group-hover:text-foreground/80 transition-colors duration-150">
-          {hasRunning
-            ? friendlyToolLabel(toolCalls.find((tc) => tc.isRunning)!)
-            : summary || `${total} steps`
-          }
-          {hasError && allDone && (
-            <span className="ml-1.5 text-foreground/30">· {toolCalls.filter(tc => tc.isError).length} failed</span>
+          {/* Expand chevron */}
+          {isExpanded ? (
+            <ChevronDown className="h-3.5 w-3.5 flex-shrink-0 text-foreground/30 group-hover:text-foreground/60 transition-colors duration-150" />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5 flex-shrink-0 text-foreground/30 group-hover:text-foreground/60 transition-colors duration-150" />
           )}
-        </span>
-
-        {/* Expand chevron */}
-        <span className="flex-shrink-0 text-[10px] font-mono text-foreground/30 group-hover:text-foreground/60 transition-colors duration-150">
-          {isExpanded ? "▾" : "▸"}
-        </span>
-      </button>
+        </button>
+        <div className="w-full min-w-full border-t border-border/50" />
+      </div>
 
       {/* Expanded rail view */}
       <AnimatePresence>
@@ -997,16 +1215,28 @@ function ToolCallGroup({
 // Renders message content with interleaved text and tool call blocks
 export function MessageContent({
   message,
+  isGenerating = false,
   deferSourceFooter = false,
+  connectionItems = [],
   onImageClick,
   onRetry,
   onOpenViewerPath,
+  onOpenConnectionSetup,
+  onConnectConnectionAction,
+  onContinueConnectionAction,
+  onDismissConnectionAction,
 }: {
   message: Message;
+  isGenerating?: boolean;
   deferSourceFooter?: boolean;
+  connectionItems?: ConnectionListItem[];
   onImageClick?: (images: string[], index: number) => void;
   onRetry?: (prompt: string) => void;
   onOpenViewerPath?: (path: string) => void;
+  onOpenConnectionSetup?: (connectionId: string) => void | Promise<void>;
+  onConnectConnectionAction?: (connectionId: string, block?: Extract<ContentBlock, { type: "connection_action" }>) => Promise<InlineConnectStatus | void> | InlineConnectStatus | void;
+  onContinueConnectionAction?: (prompt: string, label?: string) => void | Promise<void>;
+  onDismissConnectionAction?: (messageId: string, connectionId: string) => void;
 }) {
   const isUser = message.role === "user";
   const { settings } = useSettings();
@@ -1145,8 +1375,13 @@ export function MessageContent({
     // and the chat panel reads as empty even though there's real
     // content to see.
     const hasText = grouped.some((g) => g.type === "text");
+    const stoppedSummary = message.stoppedByUser
+      ? formatStoppedWorkDuration(message.workDurationMs)
+      : undefined;
+    const hasWorkStatusGroup = displayGroups.some((g) => g.type === "tool-group" || g.type === "work-group");
     return (
       <div className="space-y-2 min-w-0 w-full overflow-hidden">
+        {stoppedSummary && !hasWorkStatusGroup ? <WorkStatusHeader label={stoppedSummary} /> : null}
         {displayGroups.map((group) => {
           if (group.type === "text") {
             return (
@@ -1176,8 +1411,37 @@ export function MessageContent({
             if (hideThinkingBlocks) return null;
             return <ThinkingBlock key={`thinking-${group.key}`} text={group.text} isThinking={group.isThinking} durationMs={group.durationMs} />;
           }
+          if (group.type === "connection-action") {
+            const liveConnection = connectionItems.find((connection) => connection.id === group.block.connectionId);
+            const connected = liveConnection?.connected ?? false;
+            return (
+              <InlineConnectionActionCard
+                key={`connection-${group.key}-${group.block.connectionId}`}
+                block={group.block}
+                connected={connected}
+                onConnect={() => {
+                  if (onConnectConnectionAction) {
+                    return onConnectConnectionAction(group.block.connectionId, group.block);
+                  }
+                  return onOpenConnectionSetup?.(group.block.connectionId);
+                }}
+                onContinue={onContinueConnectionAction}
+                onDismiss={() => onDismissConnectionAction?.(message.id, group.block.connectionId)}
+              />
+            );
+          }
           if (group.type === "tool-group") {
-            return <ToolCallGroup key={`tools-${group.key}`} toolCalls={group.toolCalls} defaultExpanded={!hasText} />;
+            return (
+              <ToolCallGroup
+                key={`tools-${group.key}`}
+                toolCalls={group.toolCalls}
+                defaultExpanded={!hasText}
+                isGenerating={isGenerating && !message.workDurationMs}
+                preferSummaryOverride={Boolean(stoppedSummary)}
+                summaryOverride={stoppedSummary || (message.workDurationMs ? formatWorkDuration(message.workDurationMs) : undefined)}
+                workStartedAtMs={message.timestamp}
+              />
+            );
           }
           if (group.type === "work-group") {
             // Fall back to message-level workDurationMs when the
@@ -1190,8 +1454,10 @@ export function MessageContent({
                 key={`work-${group.key}`}
                 toolCalls={group.toolCalls}
                 defaultExpanded={!hasText}
-                summaryOverride={formatWorkDuration(durationMs)}
-                hideCount={hasText}
+                isGenerating={isGenerating && !message.workDurationMs}
+                preferSummaryOverride={Boolean(stoppedSummary)}
+                summaryOverride={stoppedSummary || formatWorkDuration(durationMs)}
+                workStartedAtMs={message.timestamp}
               />
             );
           }
@@ -1210,24 +1476,30 @@ export function MessageContent({
   const displayText = !isUser && message.content.startsWith("Error: ")
     ? message.content.slice("Error: ".length)
     : message.content;
+  const stoppedSummary = !isUser && message.stoppedByUser
+    ? formatStoppedWorkDuration(message.workDurationMs)
+    : undefined;
 
   return (
-    <div className="space-y-2">
+    <div className="space-y-2 min-w-0 w-full">
       {attachmentsRow}
-      <MarkdownBlock
-        text={displayText}
-        isUser={isUser}
-        onOpenViewerPath={onOpenViewerPath}
-        renderSpecialCodeBlock={(language, content) => {
-          if (language === "mermaid") {
-            return <MermaidDiagramBlock chart={content} />;
-          }
-          if (language === "app-stats") {
-            return <AppStatsBlock content={content} />;
-          }
-          return null;
-        }}
-      />
+      {stoppedSummary ? <WorkStatusHeader label={stoppedSummary} /> : null}
+      {displayText ? (
+        <MarkdownBlock
+          text={displayText}
+          isUser={isUser}
+          onOpenViewerPath={onOpenViewerPath}
+          renderSpecialCodeBlock={(language, content) => {
+            if (language === "mermaid") {
+              return <MermaidDiagramBlock chart={content} />;
+            }
+            if (language === "app-stats") {
+              return <AppStatsBlock content={content} />;
+            }
+            return null;
+          }}
+        />
+      ) : null}
       {sourceFooter}
       {retryCta}
     </div>

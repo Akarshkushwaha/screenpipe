@@ -419,7 +419,7 @@ describe("Windows user journey", function () {
     await restoredHomeSection.waitForExist({ timeout: t(20_000) });
   });
 
-  it("opens Recording settings and reveals Windows audio troubleshooting controls", async function () {
+  it("opens Recording settings and shows core audio/screen controls", async function () {
     if (!isWindows) this.skip();
 
     await openHomeWindow();
@@ -440,28 +440,8 @@ describe("Windows user journey", function () {
       "Recording settings did not show the core audio/screen controls",
     );
 
-    const audioWasEnabled = await switchIsChecked("#disableAudio");
-    try {
-      await setSwitchChecked("#disableAudio", true);
-      // Audio recording is enabled by default (disableAudio: false), so the
-      // troubleshooting controls below render without a pending change. Do NOT
-      // assert "apply & restart" here — that button only appears when there are
-      // unsaved changes, which is not the case when audio is already enabled.
-      await waitForBodyText(
-        (bodyText) =>
-          bodyText.includes("auto-select audio devices") &&
-          bodyText.includes("microphone echo cancellation") &&
-          bodyText.includes("windows wasapi aec"),
-        "Windows audio troubleshooting controls did not appear after enabling audio recording",
-      );
-
-      const recordingScreenshot = await saveScreenshot("windows-user-journey-recording-settings");
-      expect(existsSync(recordingScreenshot)).toBe(true);
-    } finally {
-      if (!audioWasEnabled) {
-        await setSwitchChecked("#disableAudio", false).catch(() => {});
-      }
-    }
+    const recordingScreenshot = await saveScreenshot("windows-user-journey-recording-settings");
+    expect(existsSync(recordingScreenshot)).toBe(true);
   });
 
   it("starts and stops a manual meeting note from the visible Meetings UI", async function () {
@@ -716,7 +696,7 @@ describe("Windows user journey", function () {
     const notificationId = `windows-e2e-bell-${Date.now()}`;
     const notificationTitle = "Windows UX notification";
     const notificationBody = "Notification body visible from the bell history.";
-    const displayChangesSelector = '[data-testid="notification-pref-display-changes"]';
+    const displayChangesSelector = '[data-testid="notification-pref-displayChanges"]';
     let initialDisplayChanges: boolean | null = null;
 
     try {
@@ -741,7 +721,7 @@ describe("Windows user journey", function () {
       // inner div and *toggles* expand/collapse, so the click must never fire on
       // an already-open row. The earlier version split the "is it expanded?"
       // check and the click across two WebDriver round-trips; the 5s history
-      // poll + mark-all-read pass re-render the list between those two calls, so
+      // poll re-renders the list between those two calls, so
       // the unconditional toggle-click could land on a row that had just
       // expanded and collapse it again — livelocking until the 30s timeout (it
       // failed on both the initial attempt and the retry in CI). Do the check

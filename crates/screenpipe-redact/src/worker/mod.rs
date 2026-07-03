@@ -19,8 +19,10 @@
 mod columns;
 mod tables;
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify};
@@ -28,7 +30,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
-use crate::Redactor;
+use crate::{Pipeline, Redactor};
 
 pub use columns::{keys as column_keys, RedactColumns};
 pub use tables::{TargetTable, ALL_TARGET_TABLES};
@@ -75,6 +77,17 @@ pub struct WorkerConfig {
     /// [`RedactColumns::default`] (clear PII on, browser_url / ui element
     /// name+description / a11y url-field off).
     pub columns: RedactColumns,
+    /// Optional directory of coding-agent session logs (`*.jsonl`) to scrub of
+    /// secrets in place each poll, or `None` (the default) to skip it. This is
+    /// a **secrets-only** sweep that runs its own regex [`Pipeline`] over every
+    /// string in each record — independent of `tables`, `columns`, and the
+    /// (possibly model-backed) row redactor — so a worker that does no DB work
+    /// can still strip credentials from agent logs. See [`crate::sessions`].
+    pub session_dir: Option<PathBuf>,
+    /// How long a session file must be untouched before it's eligible, so a run
+    /// still appending to it is never rewritten mid-flight. Only consulted when
+    /// `session_dir` is set. Default 10 min.
+    pub session_min_idle: Duration,
 }
 
 impl Default for WorkerConfig {
@@ -86,6 +99,8 @@ impl Default for WorkerConfig {
             max_active_fraction: 0.4,
             tables: ALL_TARGET_TABLES.to_vec(),
             columns: RedactColumns::default(),
+            session_dir: None,
+            session_min_idle: Duration::from_secs(10 * 60),
         }
     }
 }
@@ -225,6 +240,20 @@ impl Worker {
         }
         let mut disabled: Vec<TargetTable> = Vec::new();
 
+        // Secrets-only scrub of agent session logs, when configured. Its own
+        // regex `Pipeline` — independent of `self.redactor`, whose policy may be
+        // full-PII and/or model-backed — so secret-stripping agent logs never
+        // depends on the (opt-in) text-PII pass. A path->mtime map skips clean,
+        // unchanged files; the scan is throttled to `poll_interval` below so a
+        // backlog drain (a tight loop) doesn't re-walk the dir every batch.
+        let session_redactor = self
+            .cfg
+            .session_dir
+            .as_ref()
+            .map(|_| Pipeline::regex_only());
+        let mut session_seen: HashMap<PathBuf, SystemTime> = HashMap::new();
+        let mut last_session_scan: Option<std::time::Instant> = None;
+
         loop {
             if self.paused.load(std::sync::atomic::Ordering::SeqCst) {
                 self.set_paused(true).await;
@@ -337,6 +366,31 @@ impl Worker {
                         {
                             return;
                         }
+                    }
+                }
+            }
+
+            // Once per poll, sweep the agent session logs. Cheap when nothing
+            // is eligible: a readdir + mtime stat, skipping files unchanged
+            // since last scrubbed and any modified within `session_min_idle`
+            // (still potentially being appended to by a live run).
+            if let (Some(dir), Some(redactor)) =
+                (self.cfg.session_dir.as_ref(), session_redactor.as_ref())
+            {
+                let due = last_session_scan
+                    .map(|t| t.elapsed() >= self.cfg.poll_interval)
+                    .unwrap_or(true);
+                if due {
+                    last_session_scan = Some(std::time::Instant::now());
+                    let n = crate::sessions::scrub_dir(
+                        dir,
+                        self.cfg.session_min_idle,
+                        &mut session_seen,
+                        redactor,
+                    )
+                    .await;
+                    if n > 0 {
+                        info!("redact worker: scrubbed secrets in {n} idle agent session file(s)");
                     }
                 }
             }
@@ -555,12 +609,21 @@ impl Worker {
             "redacting ui_events batch (multi-column)"
         );
 
+        // `element_ancestors` is a JSON blob ([{"role","name"},...]), not free
+        // text: running the flat redactor over it risks the AI step mangling
+        // the JSON. It gets the structure-preserving path below (only the
+        // `name` values are scrubbed), so keep it OUT of the flat batch.
+        let ancestors_ci = active.iter().position(|c| *c == "element_ancestors");
+
         // Flatten every non-empty cell into one batch, remembering where
         // each output goes (row index, column index).
         let mut inputs: Vec<String> = Vec::new();
         let mut coords: Vec<(usize, usize)> = Vec::new();
         for (ri, row) in rows.iter().enumerate() {
             for (ci, cell) in row.cols.iter().enumerate() {
+                if Some(ci) == ancestors_ci {
+                    continue;
+                }
                 if let Some(text) = cell {
                     inputs.push(text.clone());
                     coords.push((ri, ci));
@@ -588,6 +651,35 @@ impl Worker {
             }
         }
 
+        // Ancestors: JSON-aware pass, scrubbing ONLY the hop `name` values so
+        // the structure (and the `role` path) survives. A malformed blob is
+        // warned + left as-is rather than wedging the row forever — same
+        // policy as the frames tree-JSON path.
+        if let Some(aci) = ancestors_ci {
+            for (ri, row) in rows.iter().enumerate() {
+                let Some(blob) = row.cols[aci].as_deref().filter(|b| !b.is_empty()) else {
+                    continue;
+                };
+                match crate::tree_json::redact_tree_json_with_redactor_fields(
+                    blob,
+                    &*self.redactor,
+                    &["name"],
+                )
+                .await
+                {
+                    Ok(Some(clean)) => outputs_by_row[ri][aci] = Some(clean),
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            row_id = row.id,
+                            error = %e,
+                            "element_ancestors JSON unredactable — leaving as captured"
+                        );
+                    }
+                }
+            }
+        }
+
         for (row, redacted) in rows.iter().zip(outputs_by_row.iter()) {
             tables::write_redacted_ui_events(&self.pool, &active, row.id, redacted).await?;
         }
@@ -602,8 +694,9 @@ impl Worker {
 
     /// Redact the per-frame `full_text` search surface and, in the SAME
     /// detection pass, propagate the result to that frame's DERIVED copies —
-    /// `accessibility_text`, `accessibility_tree_json` (issue #4116), `window_name` and
-    /// `browser_url`. They are all decompositions of `full_text`, so every
+    /// `accessibility_text`, `accessibility_tree_json` (issue #4116), `window_name`,
+    /// `browser_url` and the per-word OCR `text_json` (issue #4117). They are
+    /// all decompositions of `full_text`, so every
     /// PII value in them is in the detected map; applying it is pure string
     /// work (microseconds), the model runs ONCE for the whole frame instead
     /// of once per column.
@@ -626,6 +719,23 @@ impl Worker {
         for row in &rows {
             match self.redactor.redact_with_map(&row.full_text).await? {
                 Some((out, map)) => {
+                    // Propagate the single detection to every derived copy that
+                    // still needs it (no extra model pass) — CRITICAL: before
+                    // stamping full_text, mirroring the enclave arm below. The
+                    // fetch filters `full_text_redacted_at IS NULL`, so once
+                    // full_text is stamped the frame is never re-selected; if we
+                    // stamped it first and a derived write then failed (transient
+                    // DB error) or the process died mid-pass, that copy (e.g. the
+                    // raw OCR words in text_json) would be served raw forever
+                    // (#4116/#4117). Writing derived copies first means a failure
+                    // leaves full_text un-stamped and the whole frame is retried;
+                    // each copy's own `*_redacted_at IS NULL` guard makes the
+                    // retry idempotent. Establishes the invariant the single-
+                    // column fetch gate relies on: full_text stamped ⟹ every
+                    // enabled derived copy is done (malformed blobs excepted —
+                    // they're warned + skipped inside the helper, unfixable by
+                    // retry, so they must not wedge full_text).
+                    writes += self.propagate_frame_derived(row, &map).await?;
                     tables::write_redacted(
                         &self.pool,
                         TargetTable::FullText,
@@ -634,9 +744,6 @@ impl Worker {
                     )
                     .await?;
                     writes += 1;
-                    // Propagate the single detection to every derived copy
-                    // that still needs it — no extra model pass.
-                    writes += self.propagate_frame_derived(row, &map).await?;
                 }
                 None => {
                     // Span-less / no-map redactor (the Tinfoil enclave, whose
@@ -676,7 +783,8 @@ impl Worker {
 
     /// Apply a frame's [`RedactionMap`] to each derived copy that still
     /// needs redaction (`*_redacted_at IS NULL`): `accessibility_text`,
-    /// `accessibility_tree_json`, `window_name` and `browser_url`. Pure string application —
+    /// `accessibility_tree_json`, `window_name`, `browser_url` and the
+    /// per-word OCR `text_json` (#4117). Pure string application —
     /// NO model pass. The tree JSON is scrubbed field-wise (node text),
     /// preserving structure. A malformed JSON blob is logged and skipped (its
     /// watermark stays NULL); the row's `full_text` is still stamped, so the
@@ -754,6 +862,35 @@ impl Worker {
             }
         }
 
+        // text_json — per-word OCR boxes; scrub each block's `text` field-wise
+        // via the same map (geometry preserved). A malformed blob is logged
+        // and left un-stamped (same as accessibility_tree_json), so a clean
+        // frame still stamps its other copies. (issue #4117)
+        //
+        // NOT gated by a column toggle: text_json is a derived copy of the
+        // same on-screen text as `full_text`, which is ALWAYS redacted (it's
+        // the detection source). Letting full_text be scrubbed while the raw
+        // OCR words survive here — and are served verbatim by the overlay
+        // endpoints — is exactly the #4117 leak, so the two move together.
+        if let Some(tj) = row.text_json.as_deref() {
+            if !tj.is_empty() && row.text_json_redacted_at.is_none() {
+                match crate::ocr_json::redact_ocr_text_json(tj, map) {
+                    Ok(Some(json)) => {
+                        tables::write_redacted_text_json(&self.pool, row.id, &json).await?;
+                        writes += 1;
+                    }
+                    // Ok(None) means the map was empty — impossible here
+                    // (we're inside the Some(map)-with-detections arm).
+                    Ok(None) => {}
+                    Err(e) => warn!(
+                        frame_id = row.id,
+                        error = %e,
+                        "skipping malformed text_json (leaving it un-stamped)"
+                    ),
+                }
+            }
+        }
+
         Ok(writes)
     }
 
@@ -826,6 +963,44 @@ impl Worker {
                     let out = self.redactor.redact(url).await?;
                     tables::write_redacted_browser_url(&self.pool, row.id, &out.redacted).await?;
                     writes += 1;
+                }
+            }
+        }
+
+        // text_json — per-word OCR boxes; drive the redactor over each block's
+        // `text` directly (no map on this path), geometry preserved. A
+        // malformed blob is warned + left un-stamped; a redactor failure is a
+        // transient error the worker's backoff retries. (issue #4117)
+        //
+        // NOT gated by a column toggle — see the map-path note above: text_json
+        // is the structured twin of `full_text` (always redacted), so the two
+        // move together to avoid the #4117 overlay leak.
+        if let Some(tj) = row.text_json.as_deref() {
+            if !tj.is_empty() && row.text_json_redacted_at.is_none() {
+                match crate::ocr_json::redact_ocr_text_json_with_redactor(
+                    tj,
+                    self.redactor.as_ref(),
+                )
+                .await
+                {
+                    Ok(Some(json)) => {
+                        tables::write_redacted_text_json(&self.pool, row.id, &json).await?;
+                        writes += 1;
+                    }
+                    // No redactable text → stamp the verbatim blob so the
+                    // row isn't re-scanned for text_json forever.
+                    Ok(None) => {
+                        tables::write_redacted_text_json(&self.pool, row.id, tj).await?;
+                        writes += 1;
+                    }
+                    Err(crate::tree_json::TreeRedactError::Json(e)) => warn!(
+                        frame_id = row.id,
+                        error = %e,
+                        "skipping malformed text_json on enclave path (leaving it un-stamped)"
+                    ),
+                    Err(e @ crate::tree_json::TreeRedactError::Redact(_)) => {
+                        return Err(e.into());
+                    }
                 }
             }
         }

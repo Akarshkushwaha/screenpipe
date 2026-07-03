@@ -91,6 +91,13 @@ impl DeviceRecoveryBackoff {
         Self::new(Self::TRANSIENT_MAX_SECS, Self::OUTPUT_PERMANENT_MAX_SECS)
     }
 
+    fn for_device_type(device_type: &DeviceType) -> Self {
+        match device_type {
+            DeviceType::Input => Self::for_input(),
+            DeviceType::Output => Self::for_output(),
+        }
+    }
+
     fn new(transient_max_secs: u64, permanent_max_secs: u64) -> Self {
         Self {
             attempts: 0,
@@ -116,6 +123,15 @@ impl DeviceRecoveryBackoff {
         self.is_permanent = false;
     }
 
+    fn should_attempt(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_attempt)
+            >= Duration::from_secs(self.next_delay_secs())
+    }
+
+    fn record_attempt_at(&mut self, now: Instant) {
+        self.last_attempt = now;
+    }
+
     fn next_delay_secs(&self) -> u64 {
         if self.attempts == 0 {
             return 0;
@@ -131,6 +147,29 @@ impl DeviceRecoveryBackoff {
     }
 }
 
+fn default_switch_retry_delay_secs(attempts: u32) -> u64 {
+    if attempts == 0 {
+        return 0;
+    }
+    2u64.saturating_pow(attempts.min(10))
+        .min(DeviceRecoveryBackoff::TRANSIENT_MAX_SECS)
+}
+
+fn default_switch_retry_backoff_active(
+    failed_devices: &HashMap<String, (u32, Instant)>,
+    device_name: &str,
+    now: Instant,
+) -> bool {
+    let Some((attempts, last_attempt)) = failed_devices.get(device_name) else {
+        return false;
+    };
+    let delay = Duration::from_secs(default_switch_retry_delay_secs(*attempts));
+    let elapsed = now
+        .checked_duration_since(*last_attempt)
+        .unwrap_or_default();
+    elapsed < delay
+}
+
 /// Returns true if the error from `default_output_device()` indicates a
 /// permanent condition that won't resolve without hardware changes.
 fn is_permanent_output_error(err: &anyhow::Error) -> bool {
@@ -143,6 +182,47 @@ fn is_permanent_output_error(err: &anyhow::Error) -> bool {
 fn is_permanent_input_error(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
     msg.contains("No default input device detected")
+}
+
+fn is_permanent_device_start_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("not found")
+        || msg.contains("no default input device detected")
+        || msg.contains("no display audio device found")
+}
+
+fn should_log_recovery_attempt(attempts: u32) -> bool {
+    attempts <= 3 || attempts.is_multiple_of(30)
+}
+
+fn should_attempt_disconnected_device_recovery(
+    backoffs: &mut HashMap<String, DeviceRecoveryBackoff>,
+    device_name: &str,
+    device_type: &DeviceType,
+    now: Instant,
+) -> bool {
+    let backoff = backoffs
+        .entry(device_name.to_string())
+        .or_insert_with(|| DeviceRecoveryBackoff::for_device_type(device_type));
+    if backoff.should_attempt(now) {
+        backoff.record_attempt_at(now);
+        true
+    } else {
+        false
+    }
+}
+
+fn record_disconnected_device_failure(
+    backoffs: &mut HashMap<String, DeviceRecoveryBackoff>,
+    device_name: &str,
+    device_type: &DeviceType,
+    permanent: bool,
+) -> (u32, u64) {
+    let backoff = backoffs
+        .entry(device_name.to_string())
+        .or_insert_with(|| DeviceRecoveryBackoff::for_device_type(device_type));
+    backoff.record_failure(permanent);
+    (backoff.attempts, backoff.next_delay_secs())
 }
 
 /// Heuristic: does this input device name look like an on-board mic? Used to
@@ -385,6 +465,10 @@ impl SystemDefaultTracker {
     /// Check if system default input device has changed
     fn check_input_changed(&mut self) -> Option<String> {
         let current = default_input_device().ok().map(|d| d.to_string());
+        self.check_input_changed_from_current(current)
+    }
+
+    fn check_input_changed_from_current(&mut self, current: Option<String>) -> Option<String> {
         if current != self.last_input {
             let changed = current.clone();
             self.last_input = current;
@@ -397,6 +481,10 @@ impl SystemDefaultTracker {
     /// Check if system default output device has changed
     async fn check_output_changed(&mut self) -> Option<String> {
         let current = default_output_device().await.ok().map(|d| d.to_string());
+        self.check_output_changed_from_current(current)
+    }
+
+    fn check_output_changed_from_current(&mut self, current: Option<String>) -> Option<String> {
         if current != self.last_output {
             let changed = current.clone();
             self.last_output = current;
@@ -437,6 +525,8 @@ pub async fn start_device_monitor(
         let mut failed_devices: HashMap<String, (u32, Instant)> = HashMap::new();
         let mut input_recovery_backoff = DeviceRecoveryBackoff::for_input();
         let mut output_recovery_backoff = DeviceRecoveryBackoff::for_output();
+        let mut disconnected_device_backoffs: HashMap<String, DeviceRecoveryBackoff> =
+            HashMap::new();
 
         // Central handler restart cooldown: max 3 restarts in a 5-minute window
         let mut central_restart_times: Vec<Instant> = Vec::new();
@@ -700,6 +790,7 @@ pub async fn start_device_monitor(
                     }
 
                     // Check if system default input changed
+                    let previous_default_input = default_tracker.last_input.clone();
                     if let Some(new_default_input) = default_tracker.check_input_changed() {
                         if audio_manager
                             .user_disabled_devices()
@@ -716,12 +807,20 @@ pub async fn start_device_monitor(
                             // nothing if the new device failed to start — a silent
                             // mic loss with no recovery. Mirrors the output swap
                             // below, which has always been start-first.
-                            let new_started = if let Ok(new_device) =
-                                parse_audio_device(&new_default_input)
-                            {
-                                failed_devices.remove(&new_default_input);
+                            let new_started = if default_switch_retry_backoff_active(
+                                &failed_devices,
+                                &new_default_input,
+                                Instant::now(),
+                            ) {
+                                debug!(
+                                    "[DEVICE_RECOVERY] default input switch retry backing off: {}",
+                                    new_default_input
+                                );
+                                false
+                            } else if let Ok(new_device) = parse_audio_device(&new_default_input) {
                                 match audio_manager.start_device(&new_device).await {
                                     Ok(()) => {
+                                        failed_devices.remove(&new_default_input);
                                         info!(
                                             "switched to new system default input: {}",
                                             new_default_input
@@ -757,6 +856,8 @@ pub async fn start_device_monitor(
                                         }
                                     }
                                 }
+                            } else {
+                                default_tracker.last_input = previous_default_input;
                             }
                         } // else: skip user-disabled
                     }
@@ -765,6 +866,7 @@ pub async fn start_device_monitor(
                     // Atomic swap: start new device FIRST, then stop old ones.
                     // This ensures continuous audio capture — if the new device
                     // fails to start, the old devices keep running as fallback.
+                    let previous_default_output = default_tracker.last_output.clone();
                     if let Some(new_default_output) = default_tracker.check_output_changed().await {
                         // Skip if new default is user-disabled
                         if audio_manager
@@ -779,12 +881,20 @@ pub async fn start_device_monitor(
                                 new_default_output
                             );
 
-                            let new_started = if let Ok(new_device) =
-                                parse_audio_device(&new_default_output)
-                            {
-                                failed_devices.remove(&new_default_output);
+                            let new_started = if default_switch_retry_backoff_active(
+                                &failed_devices,
+                                &new_default_output,
+                                Instant::now(),
+                            ) {
+                                debug!(
+                                    "[DEVICE_RECOVERY] default output switch retry backing off: {}",
+                                    new_default_output
+                                );
+                                false
+                            } else if let Ok(new_device) = parse_audio_device(&new_default_output) {
                                 match audio_manager.start_device(&new_device).await {
                                     Ok(()) => {
+                                        failed_devices.remove(&new_default_output);
                                         info!(
                                         "[DEVICE_RECOVERY] started new system default output: {}",
                                         new_default_output
@@ -792,6 +902,11 @@ pub async fn start_device_monitor(
                                         true
                                     }
                                     Err(e) => {
+                                        let count = failed_devices
+                                            .entry(new_default_output.clone())
+                                            .or_insert((0, Instant::now()));
+                                        count.0 += 1;
+                                        count.1 = Instant::now();
                                         warn!(
                                             "[DEVICE_RECOVERY] failed to start new default output {}: {} — keeping old devices running",
                                             new_default_output, e
@@ -826,6 +941,8 @@ pub async fn start_device_monitor(
                                         }
                                     }
                                 }
+                            } else {
+                                default_tracker.last_output = previous_default_output;
                             }
                         } // else: skip user-disabled
                     }
@@ -1195,6 +1312,7 @@ pub async fn start_device_monitor(
                     // Skip user-disabled devices — they're intentionally stopped
                     if user_disabled_for_reconnect.contains(&device_name) {
                         disconnected_devices.remove(&device_name);
+                        disconnected_device_backoffs.remove(&device_name);
                         continue;
                     }
 
@@ -1202,24 +1320,133 @@ pub async fn start_device_monitor(
                         Ok(device) => device,
                         Err(e) => {
                             debug!("Device name {} invalid: {}", device_name, e);
+                            disconnected_devices.remove(&device_name);
+                            disconnected_device_backoffs.remove(&device_name);
                             continue;
                         }
                     };
 
+                    let now = Instant::now();
+                    if !should_attempt_disconnected_device_recovery(
+                        &mut disconnected_device_backoffs,
+                        &device_name,
+                        &device.device_type,
+                        now,
+                    ) {
+                        continue;
+                    }
+
                     // In system default mode, try to restart with current default instead
                     if audio_manager.use_system_default_audio().await {
-                        let current_default = match device.device_type {
-                            DeviceType::Input => default_input_device().ok(),
-                            DeviceType::Output => default_output_device().await.ok(),
-                        };
-
-                        if let Some(default_device) = current_default {
-                            if audio_manager.start_device(&default_device).await.is_ok() {
-                                info!("restarted with system default device: {}", default_device);
-                                disconnected_devices.remove(&device_name);
-                                continue;
-                            }
+                        match &device.device_type {
+                            DeviceType::Input => match default_input_device() {
+                                Ok(default_device) => {
+                                    match audio_manager.start_device(&default_device).await {
+                                        Ok(()) => {
+                                            info!(
+                                                "restarted with system default device: {}",
+                                                default_device
+                                            );
+                                            disconnected_devices.remove(&device_name);
+                                            disconnected_device_backoffs.remove(&device_name);
+                                        }
+                                        Err(e) => {
+                                            let permanent = is_permanent_device_start_error(&e);
+                                            let (attempts, delay) =
+                                                record_disconnected_device_failure(
+                                                    &mut disconnected_device_backoffs,
+                                                    &device_name,
+                                                    &device.device_type,
+                                                    permanent,
+                                                );
+                                            if should_log_recovery_attempt(attempts) {
+                                                warn!(
+                                                    "[DEVICE_RECOVERY] failed to restart current system default {} for stale {} (attempt {}, next retry in {}s): {}",
+                                                    default_device,
+                                                    device_name,
+                                                    attempts,
+                                                    delay,
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let permanent = is_permanent_input_error(&e);
+                                    let (attempts, delay) = record_disconnected_device_failure(
+                                        &mut disconnected_device_backoffs,
+                                        &device_name,
+                                        &device.device_type,
+                                        permanent,
+                                    );
+                                    if should_log_recovery_attempt(attempts) {
+                                        warn!(
+                                            "[DEVICE_RECOVERY] no system default input while recovering stale {} (attempt {}, {}, next retry in {}s): {}",
+                                            device_name,
+                                            attempts,
+                                            if permanent { "permanent" } else { "transient" },
+                                            delay,
+                                            e
+                                        );
+                                    }
+                                }
+                            },
+                            DeviceType::Output => match default_output_device().await {
+                                Ok(default_device) => {
+                                    match audio_manager.start_device(&default_device).await {
+                                        Ok(()) => {
+                                            info!(
+                                                "restarted with system default device: {}",
+                                                default_device
+                                            );
+                                            disconnected_devices.remove(&device_name);
+                                            disconnected_device_backoffs.remove(&device_name);
+                                        }
+                                        Err(e) => {
+                                            let permanent = is_permanent_device_start_error(&e);
+                                            let (attempts, delay) =
+                                                record_disconnected_device_failure(
+                                                    &mut disconnected_device_backoffs,
+                                                    &device_name,
+                                                    &device.device_type,
+                                                    permanent,
+                                                );
+                                            if should_log_recovery_attempt(attempts) {
+                                                warn!(
+                                                    "[DEVICE_RECOVERY] failed to restart current system default {} for stale {} (attempt {}, next retry in {}s): {}",
+                                                    default_device,
+                                                    device_name,
+                                                    attempts,
+                                                    delay,
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let permanent = is_permanent_output_error(&e);
+                                    let (attempts, delay) = record_disconnected_device_failure(
+                                        &mut disconnected_device_backoffs,
+                                        &device_name,
+                                        &device.device_type,
+                                        permanent,
+                                    );
+                                    if should_log_recovery_attempt(attempts) {
+                                        warn!(
+                                            "[DEVICE_RECOVERY] no system default output while recovering stale {} (attempt {}, {}, next retry in {}s): {}",
+                                            device_name,
+                                            attempts,
+                                            if permanent { "permanent" } else { "transient" },
+                                            delay,
+                                            e
+                                        );
+                                    }
+                                }
+                            },
                         }
+                        continue;
                     }
 
                     match audio_manager.start_device(&device).await {
@@ -1229,12 +1456,32 @@ pub async fn start_device_monitor(
                                 device_name
                             );
                             disconnected_devices.remove(&device_name);
+                            disconnected_device_backoffs.remove(&device_name);
                         }
                         Err(e) => {
-                            warn!(
-                                "[DEVICE_RECOVERY] failed to restart device {}: {}",
-                                device_name, e
+                            let e_str = e.to_string();
+                            if e_str.contains("already running") {
+                                disconnected_devices.remove(&device_name);
+                                disconnected_device_backoffs.remove(&device_name);
+                                continue;
+                            }
+                            let permanent = is_permanent_device_start_error(&e);
+                            let (attempts, delay) = record_disconnected_device_failure(
+                                &mut disconnected_device_backoffs,
+                                &device_name,
+                                &device.device_type,
+                                permanent,
                             );
+                            if should_log_recovery_attempt(attempts) {
+                                warn!(
+                                    "[DEVICE_RECOVERY] failed to restart device {} (attempt {}, {}, next retry in {}s): {}",
+                                    device_name,
+                                    attempts,
+                                    if permanent { "permanent" } else { "transient" },
+                                    delay,
+                                    e
+                                );
+                            }
                         }
                     }
                 }
@@ -1729,6 +1976,75 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_input_backoff_suppresses_two_second_retry_storm() {
+        let mut backoffs = HashMap::new();
+        let device_name = "Microphone (USB Composite Device) (input)";
+        let start = Instant::now();
+        let mut attempted_at_secs = Vec::new();
+
+        // Reproduce the monitor's 2s cadence for one minute while Windows has
+        // no default input device and the stale USB mic cannot be restarted.
+        // Before this backoff, the monitor attempted all 30 ticks.
+        for tick in 0_u64..30 {
+            let now = start + Duration::from_secs(tick * 2);
+            if should_attempt_disconnected_device_recovery(
+                &mut backoffs,
+                device_name,
+                &DeviceType::Input,
+                now,
+            ) {
+                attempted_at_secs.push(tick * 2);
+                record_disconnected_device_failure(
+                    &mut backoffs,
+                    device_name,
+                    &DeviceType::Input,
+                    true,
+                );
+            }
+        }
+
+        assert_eq!(attempted_at_secs, vec![0, 2, 6, 14, 30]);
+        let backoff = backoffs.get(device_name).unwrap();
+        assert_eq!(backoff.attempts, attempted_at_secs.len() as u32);
+        assert_eq!(backoff.next_delay_secs(), 30);
+    }
+
+    #[test]
+    fn disconnected_transient_backoff_keeps_recovery_responsive() {
+        let mut backoff = DeviceRecoveryBackoff::for_input();
+        let start = Instant::now();
+        let mut attempted_at_secs = Vec::new();
+
+        // Transient failures stay capped at 8s so a briefly flapping device can
+        // still recover quickly without retrying every monitor cycle.
+        for tick in 0_u64..10 {
+            let now = start + Duration::from_secs(tick * 2);
+            if backoff.should_attempt(now) {
+                attempted_at_secs.push(tick * 2);
+                backoff.record_attempt_at(now);
+                backoff.record_failure(false);
+            }
+        }
+
+        assert_eq!(attempted_at_secs, vec![0, 2, 6, 14]);
+        assert_eq!(backoff.next_delay_secs(), 8);
+    }
+
+    #[test]
+    fn disconnected_backoff_allows_immediate_attempt_after_success_reset() {
+        let mut backoff = DeviceRecoveryBackoff::for_input();
+        let start = Instant::now();
+
+        assert!(backoff.should_attempt(start));
+        backoff.record_attempt_at(start);
+        backoff.record_failure(true);
+        assert!(!backoff.should_attempt(start + Duration::from_secs(1)));
+
+        backoff.reset();
+        assert!(backoff.should_attempt(start + Duration::from_secs(1)));
+    }
+
+    #[test]
     fn test_backoff_transient_then_permanent_escalates() {
         let mut b = DeviceRecoveryBackoff::for_output();
         b.record_failure(false); // transient
@@ -1739,6 +2055,15 @@ mod tests {
         assert_eq!(b.next_delay_secs(), 8); // 2^3 = 8, under 120 cap
         b.record_failure(true);
         assert_eq!(b.next_delay_secs(), 16);
+    }
+
+    #[test]
+    fn default_switch_retry_backoff_caps_at_8s() {
+        assert_eq!(default_switch_retry_delay_secs(0), 0);
+        assert_eq!(default_switch_retry_delay_secs(1), 2);
+        assert_eq!(default_switch_retry_delay_secs(2), 4);
+        assert_eq!(default_switch_retry_delay_secs(3), 8);
+        assert_eq!(default_switch_retry_delay_secs(4), 8);
     }
 
     #[test]
@@ -1767,6 +2092,31 @@ mod tests {
     }
 
     #[test]
+    fn test_permanent_device_start_error_detection() {
+        assert!(is_permanent_device_start_error(&anyhow::anyhow!(
+            "device Microphone (USB Composite Device) (input) not found"
+        )));
+        assert!(is_permanent_device_start_error(&anyhow::anyhow!(
+            "No default input device detected"
+        )));
+        assert!(is_permanent_device_start_error(&anyhow::anyhow!(
+            "no display audio device found"
+        )));
+        assert!(!is_permanent_device_start_error(&anyhow::anyhow!(
+            "callback never fired"
+        )));
+    }
+
+    #[test]
+    fn test_recovery_attempt_log_throttling() {
+        assert!(should_log_recovery_attempt(1));
+        assert!(should_log_recovery_attempt(3));
+        assert!(!should_log_recovery_attempt(4));
+        assert!(should_log_recovery_attempt(30));
+        assert!(!should_log_recovery_attempt(31));
+    }
+
+    #[test]
     fn test_cooldown_evicts_old_entries() {
         let mut cd = RestartCooldown::new(3, Duration::from_secs(0)); // 0s window: everything expires instantly
         cd.record_restart();
@@ -1786,6 +2136,90 @@ mod tests {
 
     fn set(items: &[&str]) -> HashSet<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    struct DefaultInputSwitchRepro {
+        tracker: SystemDefaultTracker,
+        failed_devices: HashMap<String, (u32, Instant)>,
+        running_input: String,
+        start_attempts: usize,
+    }
+
+    impl DefaultInputSwitchRepro {
+        fn new(initial_default: &str) -> Self {
+            let mut tracker = SystemDefaultTracker::new();
+            tracker.last_input = Some(initial_default.to_string());
+            Self {
+                tracker,
+                failed_devices: HashMap::new(),
+                running_input: initial_default.to_string(),
+                start_attempts: 0,
+            }
+        }
+
+        fn poll(&mut self, current_default: &str, default_is_startable: bool, now: Instant) {
+            let previous_default = self.tracker.last_input.clone();
+            if let Some(new_default) = self
+                .tracker
+                .check_input_changed_from_current(Some(current_default.to_string()))
+            {
+                if default_switch_retry_backoff_active(&self.failed_devices, &new_default, now) {
+                    self.tracker.last_input = previous_default;
+                    return;
+                }
+
+                self.start_attempts += 1;
+
+                if default_is_startable {
+                    self.failed_devices.remove(&new_default);
+                    self.running_input = new_default;
+                } else {
+                    let count = self.failed_devices.entry(new_default).or_insert((0, now));
+                    count.0 += 1;
+                    count.1 = now;
+                    self.tracker.last_input = previous_default;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn default_input_change_retries_after_transient_not_found() {
+        let realtek = "Microphone (Realtek(R) Audio) (input)";
+        let krisp = "Krisp Microphone (Krisp Audio) (input)";
+        let now = Instant::now();
+
+        let mut repro = DefaultInputSwitchRepro::new(realtek);
+
+        // Windows reports Krisp as the new default before the audio device list
+        // can start it, matching the observed "device ... not found" log.
+        repro.poll(krisp, false, now);
+        assert_eq!(repro.start_attempts, 1);
+        assert_eq!(repro.running_input, realtek);
+
+        // A too-early monitor tick should keep the old mic and avoid hammering
+        // the device list.
+        repro.poll(
+            krisp,
+            true,
+            now.checked_add(Duration::from_secs(1)).unwrap(),
+        );
+        assert_eq!(repro.start_attempts, 1);
+        assert_eq!(repro.running_input, realtek);
+
+        // Once the small retry backoff has elapsed, the still-pending default
+        // switch should be attempted again.
+        repro.poll(
+            krisp,
+            true,
+            now.checked_add(Duration::from_secs(2)).unwrap(),
+        );
+
+        assert_eq!(
+            repro.start_attempts, 2,
+            "failed default-device switches must stay pending and retry even when the old mic is still running"
+        );
+        assert_eq!(repro.running_input, krisp);
     }
 
     fn build_inputs<'a>(

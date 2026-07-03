@@ -119,8 +119,13 @@ pub const ALL_TARGET_TABLES: &[TargetTable] = &[
 /// - `window_title` — runtime window title (FTS-indexed).
 /// - `element_name` — AX name (FTS-indexed; can mirror field content).
 /// - `element_description` — AX description / help text.
+/// - `element_ancestors` — the ONE non-free-text member: compact JSON
+///   (`[{"role","name"},...]`, the clicked element's window-hierarchy path)
+///   whose hop `name` values carry window titles / content-mirroring group
+///   labels. Redacted JSON-aware in `process_ui_events` (names only,
+///   structure preserved), never through the flat string batch.
 ///
-/// The extra two are cheap: they ride the SAME per-row `redact_batch` the
+/// The extras are cheap: they ride the SAME per-row `redact_batch` the
 /// other columns already use (a few more strings, no extra round-trip).
 /// Structural identifiers (`element_role` / `element_automation_id` /
 /// `element_bounds`) are NOT free text and stay untouched. `browser_url` is
@@ -131,6 +136,7 @@ pub const UI_EVENT_TEXT_COLS: &[&str] = &[
     "window_title",
     "element_name",
     "element_description",
+    "element_ancestors",
 ];
 
 /// One row to redact.
@@ -278,8 +284,9 @@ pub async fn fetch_unredacted(
 
 /// A frame's `full_text` plus the sibling DERIVED copies the worker
 /// redacts from the SAME detection pass (screenpipe/website#291):
-/// `accessibility_text`, `accessibility_tree_json` (issue #4116) and
-/// `window_name`. `full_text` is the union of accessibility + OCR text
+/// `accessibility_text`, `accessibility_tree_json` (issue #4116),
+/// `window_name`, `browser_url`, and the per-word OCR `text_json`
+/// (issue #4117). `full_text` is the union of accessibility + OCR text
 /// (migration `20260312000000_consolidate_search_to_frames_full_text.sql`),
 /// so every PII value in those derived copies is present in `full_text` —
 /// detect once on `full_text`, propagate the resulting map to each. Each
@@ -309,6 +316,13 @@ pub struct FrameTextRow {
     /// are tolerable here (URLs in the timeline are for context, not fetch).
     pub browser_url: Option<String>,
     pub browser_url_redacted_at: Option<i64>,
+    /// Per-word OCR bounding boxes (`OcrTextBlock[]`) — each block's `text`
+    /// is a substring of `full_text`, so it's scrubbed via the propagated map
+    /// (only the `text` field; geometry preserved) and served raw by the
+    /// text-overlay endpoints if left alone (issue #4117). `None` if the frame
+    /// had no OCR boxes (e.g. accessibility-only capture).
+    pub text_json: Option<String>,
+    pub text_json_redacted_at: Option<i64>,
 }
 
 /// Fetch up to `limit` frames whose `full_text` needs redaction
@@ -321,7 +335,8 @@ pub async fn fetch_unredacted_frames_fulltext(
     let q = "SELECT id, full_text, accessibility_text, accessibility_redacted_at, \
                     accessibility_tree_json, accessibility_tree_redacted_at, \
                     window_name, window_name_redacted_at, \
-                    browser_url, browser_url_redacted_at \
+                    browser_url, browser_url_redacted_at, \
+                    text_json, text_json_redacted_at \
              FROM frames \
              WHERE full_text IS NOT NULL AND full_text != '' \
                AND full_text_redacted_at IS NULL \
@@ -352,6 +367,10 @@ pub async fn fetch_unredacted_frames_fulltext(
                 .get::<Option<Vec<u8>>, _>("browser_url")
                 .map(|b| String::from_utf8_lossy(&b).into_owned()),
             browser_url_redacted_at: r.get::<Option<i64>, _>("browser_url_redacted_at"),
+            text_json: r
+                .get::<Option<Vec<u8>>, _>("text_json")
+                .map(|b| String::from_utf8_lossy(&b).into_owned()),
+            text_json_redacted_at: r.get::<Option<i64>, _>("text_json_redacted_at"),
         })
         .collect();
     Ok(out)
@@ -371,6 +390,30 @@ pub async fn write_redacted_tree(
         "UPDATE frames SET \
             accessibility_tree_json = ?, \
             accessibility_tree_redacted_at = strftime('%s', 'now') \
+         WHERE id = ?",
+    )
+    .bind(redacted_json)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Overwrite `frames.text_json` (per-word OCR boxes) with its redacted form
+/// and stamp `text_json_redacted_at` (issue #4117). Separate from
+/// [`write_redacted`] because `text_json` is JSON — never redacted via plain
+/// string redaction (that would mangle the structure); only ever scrubbed
+/// field-wise (each block's `text`, geometry preserved) via a propagated map.
+/// `text_json` is NOT a `frames_fts` column, so no search-index trigger fires.
+pub async fn write_redacted_text_json(
+    pool: &SqlitePool,
+    id: i64,
+    redacted_json: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE frames SET \
+            text_json = ?, \
+            text_json_redacted_at = strftime('%s', 'now') \
          WHERE id = ?",
     )
     .bind(redacted_json)
@@ -543,12 +586,42 @@ pub async fn write_redacted(
         redacted_at_col = table.redacted_at_col(),
         pk = table.pk_col(),
     );
-    sqlx::query(&q)
-        .bind(redacted)
-        .bind(id)
-        .execute(pool)
-        .await?;
-    Ok(())
+    match sqlx::query(&q).bind(redacted).bind(id).execute(pool).await {
+        Ok(_) => Ok(()),
+        // `audio_transcriptions` carries a UNIQUE(audio_chunk_id, transcription)
+        // index (migration 20260126200000_dedupe_audio_transcriptions). When the
+        // redacted text equals a sibling row for the same chunk, this row is a
+        // redundant duplicate — the audio pipeline's recovery/retry path can
+        // insert the same transcription twice. Letting the UNIQUE error bubble
+        // up left `redacted_at` NULL, so the worker re-fetched the same poison
+        // row every poll: a tight reconciliation loop (observed ~25k errors/day,
+        // log/CPU flooding) that also blocked the rest of the audio batch behind
+        // it. Resolve by deleting the duplicate — it drops the un-redacted copy
+        // (PII gone) and lets the worker make progress; the surviving sibling
+        // holds the equivalent text and is redacted on its own pass. The FTS
+        // delete trigger keeps the search index in sync. Scoped to
+        // AudioTranscription: no other target has a UNIQUE constraint on its
+        // redacted column, so elsewhere a UNIQUE error stays a real error.
+        Err(e) if table == TargetTable::AudioTranscription && is_unique_violation(&e) => {
+            sqlx::query("DELETE FROM audio_transcriptions WHERE id = ?")
+                .bind(id)
+                .execute(pool)
+                .await?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// True if `e` is a SQLite UNIQUE-constraint violation (extended result code
+/// 2067 = `SQLITE_CONSTRAINT_UNIQUE`, or the textual "UNIQUE constraint failed"
+/// the driver surfaces).
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .map(|d| {
+            d.code().as_deref() == Some("2067") || d.message().contains("UNIQUE constraint failed")
+        })
+        .unwrap_or(false)
 }
 
 /// One `ui_events` row to redact, carrying every free-text column so the
@@ -692,7 +765,11 @@ mod tests {
                 window_name TEXT,
                 window_name_redacted_at INTEGER,
                 browser_url TEXT,
-                browser_url_redacted_at INTEGER
+                browser_url_redacted_at INTEGER,
+                -- Per-word OCR boxes (issue #4117); scrubbed via full_text
+                -- propagation (only each block's `text`, geometry preserved).
+                text_json TEXT,
+                text_json_redacted_at INTEGER
             );
             CREATE TABLE ui_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -702,6 +779,7 @@ mod tests {
                 element_name TEXT,
                 element_value TEXT,
                 element_description TEXT,
+                element_ancestors TEXT,
                 redacted_at INTEGER
             );
             -- Per-element OCR/accessibility rows; `text` is NULL on
@@ -776,6 +854,111 @@ mod tests {
         let when: Option<i64> = row.get(1);
         assert_eq!(raw, "[EMAIL]", "source column must be overwritten");
         assert!(when.is_some(), "redacted_at must be stamped");
+    }
+
+    /// Create the `audio_transcriptions` table with the production
+    /// UNIQUE(audio_chunk_id, transcription) index (migration
+    /// 20260126200000_dedupe_audio_transcriptions) so the dedup-collision
+    /// path can be exercised.
+    async fn setup_audio() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE audio_transcriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                audio_chunk_id INTEGER NOT NULL,
+                transcription TEXT NOT NULL,
+                redacted_at INTEGER
+            );
+            CREATE UNIQUE INDEX idx_audio_transcription_chunk_text
+                ON audio_transcriptions(audio_chunk_id, transcription);
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    /// Regression: a duplicate transcription whose redacted text collides with
+    /// a sibling row for the same chunk must NOT error (which left it unstamped
+    /// and re-fetched forever — the ~25k-errors/day reconciliation loop). It is
+    /// deleted instead; the sibling survives and progress is made.
+    #[tokio::test]
+    async fn write_redacted_deletes_duplicate_on_unique_collision() {
+        let pool = setup_audio().await;
+        // Sibling already carrying the redacted text for chunk 1.
+        sqlx::query(
+            "INSERT INTO audio_transcriptions (id, audio_chunk_id, transcription, redacted_at) \
+             VALUES (1, 1, '[REDACTED]', 100)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Duplicate row for the same chunk, still unredacted (carries PII).
+        sqlx::query(
+            "INSERT INTO audio_transcriptions (id, audio_chunk_id, transcription) \
+             VALUES (2, 1, 'the api key is sk-proj-AbCdEf123456')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Redacting row 2 yields '[REDACTED]', which collides with row 1.
+        write_redacted(&pool, TargetTable::AudioTranscription, 2, "[REDACTED]")
+            .await
+            .expect("collision must be resolved, not surfaced as an error");
+
+        // Row 2 (the un-redacted duplicate) is gone; the sibling remains.
+        let ids: Vec<i64> = sqlx::query("SELECT id FROM audio_transcriptions ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<i64, _>(0))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1],
+            "duplicate row 2 must be deleted, sibling kept"
+        );
+    }
+
+    /// The non-colliding audio path still overwrites + stamps normally.
+    #[tokio::test]
+    async fn write_redacted_audio_normal_path_overwrites_and_stamps() {
+        let pool = setup_audio().await;
+        sqlx::query(
+            "INSERT INTO audio_transcriptions (id, audio_chunk_id, transcription) \
+             VALUES (1, 7, 'call me at +1 555 010 0000')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        write_redacted(
+            &pool,
+            TargetTable::AudioTranscription,
+            1,
+            "call me at [PHONE]",
+        )
+        .await
+        .unwrap();
+
+        let row =
+            sqlx::query("SELECT transcription, redacted_at FROM audio_transcriptions WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.get::<String, _>(0), "call me at [PHONE]");
+        assert!(
+            row.get::<Option<i64>, _>(1).is_some(),
+            "redacted_at stamped"
+        );
     }
 
     #[tokio::test]
@@ -1121,8 +1304,9 @@ mod tests {
         let pool = setup().await;
         sqlx::query(
             "INSERT INTO frames \
-                (full_text, accessibility_tree_json, window_name) \
-             VALUES ('mail bob@x.io', '[{\"text\":\"bob@x.io\"}]', 'Inbox bob@x.io')",
+                (full_text, accessibility_tree_json, window_name, text_json) \
+             VALUES ('mail bob@x.io', '[{\"text\":\"bob@x.io\"}]', 'Inbox bob@x.io', \
+                     '[{\"text\":\"bob@x.io\",\"left\":\"5\"}]')",
         )
         .execute(&pool)
         .await
@@ -1136,8 +1320,46 @@ mod tests {
             Some("[{\"text\":\"bob@x.io\"}]")
         );
         assert_eq!(r.window_name.as_deref(), Some("Inbox bob@x.io"));
+        assert_eq!(
+            r.text_json.as_deref(),
+            Some("[{\"text\":\"bob@x.io\",\"left\":\"5\"}]")
+        );
         assert!(r.accessibility_tree_redacted_at.is_none());
         assert!(r.window_name_redacted_at.is_none());
+        assert!(r.text_json_redacted_at.is_none());
+    }
+
+    /// `write_redacted_text_json` overwrites `text_json` and stamps only
+    /// `text_json_redacted_at`, leaving `full_text`'s watermark untouched.
+    #[tokio::test]
+    async fn write_redacted_text_json_overwrites_and_stamps_independently() {
+        let pool = setup().await;
+        sqlx::query(
+            "INSERT INTO frames (id, full_text, text_json) \
+             VALUES (1, 'x', '[{\"text\":\"a@x.io\",\"left\":\"5\"}]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        write_redacted_text_json(&pool, 1, "[{\"text\":\"[EMAIL]\",\"left\":\"5\"}]")
+            .await
+            .unwrap();
+
+        let row = sqlx::query(
+            "SELECT text_json, text_json_redacted_at, full_text_redacted_at \
+             FROM frames WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.get::<String, _>(0),
+            "[{\"text\":\"[EMAIL]\",\"left\":\"5\"}]"
+        );
+        assert!(row.get::<Option<i64>, _>(1).is_some());
+        // Must not touch full_text's watermark.
+        assert!(row.get::<Option<i64>, _>(2).is_none());
     }
 
     /// Each derived-copy writer overwrites only its own column + stamps only

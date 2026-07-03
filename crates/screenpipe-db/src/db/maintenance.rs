@@ -208,6 +208,22 @@ impl DatabaseManager {
                 .await?;
         let ui_events_deleted = ui_events_result.rows_affected();
 
+        // display_layout follows user deletions instead of living forever
+        // (rows carry personal device names) — but KEEP the newest snapshot
+        // in range: consumers resolve "layout at time T" as the latest row
+        // <= T, so the newest in-range row still describes the arrangement
+        // in effect for everything retained after the range.
+        sqlx::query(
+            r#"DELETE FROM display_layout WHERE timestamp BETWEEN ?1 AND ?2
+               AND id NOT IN (SELECT id FROM display_layout
+                              WHERE timestamp BETWEEN ?1 AND ?2
+                              ORDER BY timestamp DESC, id DESC LIMIT 1)"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .execute(&mut **tx.conn())
+        .await?;
+
         // 11. Commit — if this fails, no files are touched (auto-rollback)
         tx.commit().await.map_err(|e| {
             error!("failed to commit delete_time_range transaction: {}", e);
@@ -395,6 +411,22 @@ impl DatabaseManager {
                 .execute(&mut **tx.conn())
                 .await?;
         let ui_events_deleted = ui_events_result.rows_affected();
+
+        // display_layout follows user deletions instead of living forever
+        // (rows carry personal device names) — but KEEP the newest snapshot
+        // in range: consumers resolve "layout at time T" as the latest row
+        // <= T, so the newest in-range row still describes the arrangement
+        // in effect for everything retained after the range.
+        sqlx::query(
+            r#"DELETE FROM display_layout WHERE timestamp BETWEEN ?1 AND ?2
+               AND id NOT IN (SELECT id FROM display_layout
+                              WHERE timestamp BETWEEN ?1 AND ?2
+                              ORDER BY timestamp DESC, id DESC LIMIT 1)"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .execute(&mut **tx.conn())
+        .await?;
 
         // 12. Commit — if this fails, no files are touched
         tx.commit().await.map_err(|e| {
@@ -669,6 +701,22 @@ impl DatabaseManager {
                 .await?;
         let ui_events_deleted = ui_events_result.rows_affected();
 
+        // display_layout follows user deletions instead of living forever
+        // (rows carry personal device names) — but KEEP the newest snapshot
+        // in range: consumers resolve "layout at time T" as the latest row
+        // <= T, so the newest in-range row still describes the arrangement
+        // in effect for everything retained after the range.
+        sqlx::query(
+            r#"DELETE FROM display_layout WHERE timestamp BETWEEN ?1 AND ?2
+               AND id NOT IN (SELECT id FROM display_layout
+                              WHERE timestamp BETWEEN ?1 AND ?2
+                              ORDER BY timestamp DESC, id DESC LIMIT 1)"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .execute(&mut **tx.conn())
+        .await?;
+
         tx.commit().await.map_err(|e| {
             error!(
                 "failed to commit strip_heavy_text_in_range transaction: {}",
@@ -900,6 +948,22 @@ impl DatabaseManager {
                 .execute(&mut **tx.conn())
                 .await?;
         let ui_events_deleted = ui_events_result.rows_affected();
+
+        // display_layout follows user deletions instead of living forever
+        // (rows carry personal device names) — but KEEP the newest snapshot
+        // in range: consumers resolve "layout at time T" as the latest row
+        // <= T, so the newest in-range row still describes the arrangement
+        // in effect for everything retained after the range.
+        sqlx::query(
+            r#"DELETE FROM display_layout WHERE timestamp BETWEEN ?1 AND ?2
+               AND id NOT IN (SELECT id FROM display_layout
+                              WHERE timestamp BETWEEN ?1 AND ?2
+                              ORDER BY timestamp DESC, id DESC LIMIT 1)"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .execute(&mut **tx.conn())
+        .await?;
 
         tx.commit().await.map_err(|e| {
             error!(
@@ -1263,10 +1327,20 @@ impl DatabaseManager {
     /// This prevents unbounded WAL growth when long-running readers block auto-checkpoint.
     pub fn start_wal_maintenance(&self) {
         let pool = self.pool.clone();
+        let shutdown = self.close_token.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    // Exit on DatabaseManager::close() — this task's pool clone
+                    // would otherwise keep SQLite connections (and the shared
+                    // -shm WAL-index) alive across an engine restart.
+                    _ = shutdown.cancelled() => {
+                        debug!("wal maintenance: shutting down");
+                        return;
+                    }
+                }
                 match sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
                     .fetch_one(&pool)
                     .await

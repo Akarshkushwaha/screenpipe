@@ -26,4 +26,5 @@ pub mod time;
 pub mod timezone;
 pub mod transcribe;
 pub mod vault;
+pub mod vision;
 pub mod websocket;

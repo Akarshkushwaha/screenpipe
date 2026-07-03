@@ -69,6 +69,17 @@ pub struct ScheduleRule {
     pub record_mode: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(rename_all = "camelCase")]
+pub enum AecMode {
+    #[default]
+    Off,
+    Screenpipe,
+    Macos,
+    Windows,
+}
+
 /// The single source of truth for recording/capture configuration.
 ///
 /// Used by:
@@ -159,6 +170,14 @@ pub struct RecordingSettings {
     /// Ignored on non-macOS platforms. Only the system default input uses VPIO; other devices use HAL.
     #[serde(rename = "macosInputVpioEnabled", default)]
     pub macos_input_vpio_enabled: bool,
+
+    /// Request Screenpipe's software Acoustic Echo Cancellation (via sonora WebRTC AEC3).
+    #[serde(rename = "screenpipeAecEnabled", default)]
+    pub screenpipe_aec_enabled: bool,
+
+    /// Durable AEC engine choice. Missing values default to off so AEC remains opt-in.
+    #[serde(rename = "aecMode", default)]
+    pub aec_mode: AecMode,
 
     /// Duration of each audio chunk in seconds before transcription.
     /// Stored as i32 to match existing store.bin schema (cast to u64 by engine).
@@ -406,6 +425,17 @@ pub struct RecordingSettings {
     #[serde(rename = "asyncPiiRedaction", default)]
     pub async_pii_redaction: bool,
 
+    /// Strip secrets from coding-agent (pi) session logs at rest. The
+    /// agent persists full sessions — bash output, file reads, tool
+    /// results — unredacted, so any credential it touches lands in
+    /// plaintext on disk. When `true`, a background worker periodically
+    /// runs a secrets-only regex scrub over `pi/sessions/*.jsonl` (idle
+    /// files only, so a live run is never rewritten). Secrets-only and
+    /// on-device — independent of `async_pii_redaction` (the
+    /// model-backed text path). Off by default. See `screenpipe-redact`.
+    #[serde(rename = "redactAgentSessionSecrets", default)]
+    pub redact_agent_session_secrets: bool,
+
     /// Enable image-PII redaction on captured screen frames. When
     /// `true`, the `screenpipe_redact::image::worker` runs alongside
     /// the text reconciliation worker, scans the `frames` table, runs
@@ -617,6 +647,16 @@ impl RecordingSettings {
             .map(str::trim)
             .filter(|name| !name.is_empty())
     }
+
+    /// Returns effective AEC booleans as `(screenpipe, windows, macos)`.
+    pub fn effective_aec_flags(&self) -> (bool, bool, bool) {
+        match self.aec_mode {
+            AecMode::Off => (false, false, false),
+            AecMode::Screenpipe => (true, false, false),
+            AecMode::Windows => (false, true, false),
+            AecMode::Macos => (false, false, true),
+        }
+    }
 }
 
 impl Default for RecordingSettings {
@@ -634,6 +674,8 @@ impl Default for RecordingSettings {
             experimental_coreaudio_system_audio: false,
             windows_input_aec_enabled: false,
             macos_input_vpio_enabled: false,
+            screenpipe_aec_enabled: false,
+            aec_mode: AecMode::Off,
             audio_chunk_duration: 30,
             deepgram_api_key: String::new(),
             filter_music: false,
@@ -672,6 +714,7 @@ impl Default for RecordingSettings {
             languages: vec![],
             use_pii_removal: false,
             async_pii_redaction: false,
+            redact_agent_session_secrets: false,
             async_image_pii_redaction: false,
             pii_backend: default_pii_backend(),
             pii_redaction_labels: default_pii_redaction_labels(),
@@ -763,6 +806,7 @@ fn default_pii_redaction_columns() -> Vec<String> {
         "ui_text_content",
         "ui_element_value",
         "ui_window_title",
+        "ui_element_ancestors",
         "element_text",
         "element_properties",
     ]
@@ -799,6 +843,56 @@ mod tests {
         assert_eq!(settings.video_quality, "balanced");
         assert!(settings.use_system_default_audio);
         assert!(settings.ignore_incognito_windows);
+        assert!(!settings.screenpipe_aec_enabled);
+        assert!(!settings.windows_input_aec_enabled);
+        assert!(!settings.macos_input_vpio_enabled);
+        assert_eq!(settings.aec_mode, AecMode::Off);
+        assert_eq!(settings.effective_aec_flags(), (false, false, false));
+    }
+
+    #[test]
+    fn missing_aec_mode_keeps_aec_off() {
+        let settings: RecordingSettings = serde_json::from_str(
+            r#"{
+                "screenpipeAecEnabled": false,
+                "windowsInputAecEnabled": true,
+                "macosInputVpioEnabled": true
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.aec_mode, AecMode::Off);
+        assert_eq!(settings.effective_aec_flags(), (false, false, false));
+    }
+
+    #[test]
+    fn explicit_screenpipe_aec_mode_enables_software_aec() {
+        let settings: RecordingSettings = serde_json::from_str(
+            r#"{
+                "aecMode": "screenpipe",
+                "screenpipeAecEnabled": false,
+                "windowsInputAecEnabled": true,
+                "macosInputVpioEnabled": true
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.effective_aec_flags(), (true, false, false));
+    }
+
+    #[test]
+    fn explicit_aec_mode_wins_over_legacy_flags() {
+        let settings: RecordingSettings = serde_json::from_str(
+            r#"{
+                "aecMode": "windows",
+                "screenpipeAecEnabled": true,
+                "windowsInputAecEnabled": false,
+                "macosInputVpioEnabled": true
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.effective_aec_flags(), (false, true, false));
     }
 
     #[test]

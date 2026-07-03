@@ -45,6 +45,7 @@ interface UseChatComposerShellActionsOptions {
   pastedImages: string[];
   pendingDocsRef: React.MutableRefObject<PendingDoc[]>;
   attachedDocsRef: React.MutableRefObject<ExtractedDoc[]>;
+  messageHistory: string[];
   queuedPrompts: PiQueuedPrompt[];
   steerShortcutInFlightRef: React.MutableRefObject<boolean>;
   isKnownConnectionId: (id: string) => boolean;
@@ -129,6 +130,7 @@ export function useChatComposerShellActions({
   pastedImages,
   pendingDocsRef,
   attachedDocsRef,
+  messageHistory,
   queuedPrompts,
   steerShortcutInFlightRef,
   isKnownConnectionId,
@@ -138,14 +140,49 @@ export function useChatComposerShellActions({
   steerMessage,
   steerQueuedPrompt,
 }: UseChatComposerShellActionsOptions) {
+  // Index from the newest message. `null` means the user is editing normally.
+  const historyIndexRef = useRef<number | null>(null);
+
+  // Recall source for the arrow-key history. `messageHistory` is derived from
+  // the `messages` state, which lags a send: on the first message of a session
+  // `sendMessage` awaits session/preset init before committing the user
+  // message, so the just-sent text isn't in `messageHistory` yet and recall
+  // silently does nothing until a second message exists (#4400). We append to
+  // this ref synchronously at send time so the message is recallable
+  // immediately, and resync it from `messageHistory` whenever a different
+  // conversation loads.
+  const recallHistoryRef = useRef<string[]>(messageHistory);
+
+  useEffect(() => {
+    const recall = recallHistoryRef.current;
+    // Keep the locally-tracked list only while it is `messageHistory` plus
+    // freshly-sent messages not yet reflected in `messages` (the send lag).
+    // That requires `messageHistory` to be a non-empty prefix of `recall`.
+    const recallExtendsHistory =
+      messageHistory.length > 0 &&
+      messageHistory.length <= recall.length &&
+      messageHistory.every((message, index) => message === recall[index]);
+    if (!recallExtendsHistory) {
+      // A different (or new/empty) conversation loaded — adopt its history.
+      recallHistoryRef.current = messageHistory;
+    }
+  }, [messageHistory]);
+
   const sendComposerMessage = useCallback(() => {
     if (pendingDocsRef.current.length > 0) return;
     if (!input.trim() && pastedImages.length === 0 && attachedDocsRef.current.length === 0) return;
 
+    historyIndexRef.current = null;
     const chip = connectionChip;
     setConnectionChip(null);
+    const outgoing = chip ? buildChipModelContent(chip, input.trim()) : input.trim();
+    if (outgoing) {
+      // Mirror what `messageHistory` stores (message.content) so the resync
+      // prefix check above matches once the message commits.
+      recallHistoryRef.current = [...recallHistoryRef.current, outgoing];
+    }
     void sendMessage(
-      chip ? buildChipModelContent(chip, input.trim()) : input.trim(),
+      outgoing,
       chip ? buildChipDisplayContent(chip, input.trim()) : undefined,
     );
   }, [
@@ -164,6 +201,7 @@ export function useChatComposerShellActions({
   }, [sendComposerMessage]);
 
   const handlePaste = useCallback((event: React.ClipboardEvent) => {
+    historyIndexRef.current = null;
     if (handlePastedFiles(event.clipboardData)) {
       event.preventDefault();
       return;
@@ -255,6 +293,40 @@ export function useChatComposerShellActions({
       return;
     }
 
+    const isPlainArrow = !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey;
+    const recallHistory = recallHistoryRef.current;
+    if (
+      !mentions.isOpen &&
+      isPlainArrow &&
+      event.key === "ArrowUp" &&
+      (input === "" || historyIndexRef.current !== null)
+    ) {
+      const nextIndex = Math.min((historyIndexRef.current ?? -1) + 1, recallHistory.length - 1);
+      if (nextIndex >= 0) {
+        event.preventDefault();
+        historyIndexRef.current = nextIndex;
+        setInput(recallHistory[recallHistory.length - 1 - nextIndex]);
+      }
+      return;
+    }
+
+    if (
+      !mentions.isOpen &&
+      isPlainArrow &&
+      event.key === "ArrowDown" &&
+      historyIndexRef.current !== null
+    ) {
+      event.preventDefault();
+      const nextIndex = historyIndexRef.current - 1;
+      historyIndexRef.current = nextIndex >= 0 ? nextIndex : null;
+      setInput(nextIndex >= 0 ? recallHistory[recallHistory.length - 1 - nextIndex] : "");
+      return;
+    }
+
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") {
+      historyIndexRef.current = null;
+    }
+
     if (event.key === "Enter" && !event.shiftKey && !mentions.isOpen) {
       event.preventDefault();
       sendComposerMessage();
@@ -283,6 +355,7 @@ export function useChatComposerShellActions({
     handleSteerShortcut,
     isComposing,
     isMac,
+    input,
     mentionActions,
     mentions,
     sendComposerMessage,

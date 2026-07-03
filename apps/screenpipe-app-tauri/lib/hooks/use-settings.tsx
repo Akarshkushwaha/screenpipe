@@ -10,6 +10,7 @@ import { Store } from "@tauri-apps/plugin-store";
 import { emit, listen } from "@tauri-apps/api/event";
 import React, { createContext, useContext, useEffect, useRef, useState } from "react";
 import posthog from "posthog-js";
+import { cacheAnalyticsId } from "@/lib/analytics-id";
 import { User } from "../utils/tauri";
 import { SettingsStore } from "../utils/tauri";
 import { installAuthInterceptor } from "../auth-guard";
@@ -112,6 +113,7 @@ export interface ChatMessage {
 	}>;
 	interruptedBySteer?: boolean;
 	steeredResponse?: boolean;
+	stoppedByUser?: boolean;
 	/** Wall-clock work duration for coalesced assistant messages (pipe
 	 *  runs). Used by the chat renderer as a fallback when no thinking
 	 *  blocks contributed a duration, so the work-group can still show
@@ -299,6 +301,10 @@ export type Settings = SettingsStore & {
 	windowsInputAecEnabled?: boolean;
 	/** Experimental: request Apple VoiceProcessingIO AEC on the default macOS microphone. */
 	macosInputVpioEnabled?: boolean;
+	/** Request Screenpipe's software Acoustic Echo Cancellation (via sonora WebRTC AEC3). */
+	screenpipeAecEnabled?: boolean;
+	/** Selected echo cancellation engine. Missing values default to off. */
+	aecMode?: "off" | "screenpipe" | "macos" | "windows";
 	/** Continue recording audio when the screen is locked (default: false) */
 	recordWhileLocked?: boolean;
 	/** Auto-delete local data older than retention days (free alternative to cloud archive) */
@@ -670,6 +676,8 @@ let DEFAULT_SETTINGS: Settings = {
 			experimentalCoreaudioSystemAudio: false,
 			windowsInputAecEnabled: false,
 			macosInputVpioEnabled: false,
+			screenpipeAecEnabled: false,
+			aecMode: "off",
 			recordWhileLocked: false,
 			localRetentionEnabled: false,
 			localRetentionDays: 14,
@@ -714,12 +722,30 @@ let _store: Promise<Store> | undefined;
 
 export const getStore = async () => {
 	if (!_store) {
-		// Use homeDir to match Rust backend's get_base_dir which uses $HOME/.screenpipe
-		const dir = await homeDir();
-		_store = Store.load(`${dir}/.screenpipe/store.bin`, {
-			autoSave: false,
-			defaults: {},
-		});
+		_store = (async () => {
+			// Resolve the base dir via the backend so the webview opens the same
+			// store.bin as Rust (get_base_dir honors SCREENPIPE_DATA_DIR); a
+			// hardcoded ~/.screenpipe here splits the settings store in two
+			// whenever that override is set.
+			let baseDir: string | null = null;
+			try {
+				const res = await commands.getScreenpipeBaseDir();
+				if (res.status === "ok") {
+					baseDir = res.data;
+				} else {
+					console.warn("get_screenpipe_base_dir failed, using ~/.screenpipe:", res.error);
+				}
+			} catch (e) {
+				console.warn("get_screenpipe_base_dir unavailable, using ~/.screenpipe:", e);
+			}
+			if (!baseDir) {
+				baseDir = `${await homeDir()}/.screenpipe`;
+			}
+			return Store.load(`${baseDir}/store.bin`, {
+				autoSave: false,
+				defaults: {},
+			});
+		})();
 	}
 	return _store;
 };
@@ -1240,6 +1266,12 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 	// the clerk_id so prior anonymous app events also merge forward.
 	useEffect(() => {
 		if (!settings.analyticsId) return;
+
+		// Cache the stable per-install id so posthog.init() in providers.tsx can
+		// bootstrap with it on the next launch/window — before this effect runs —
+		// keeping every window (esp. the floating search overlay) on one durable
+		// person instead of a fresh per-webview anonymous id. See lib/analytics-id.
+		cacheAnalyticsId(settings.analyticsId);
 
 		const clerkId = settings.user?.clerk_id || undefined;
 		const distinctId = clerkId || settings.analyticsId;

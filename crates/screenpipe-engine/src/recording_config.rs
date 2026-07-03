@@ -40,6 +40,11 @@ pub struct RecordingConfig {
     /// overwrites the source columns with the redacted text. Off by
     /// default.
     pub async_pii_redaction: bool,
+    /// Secrets-only scrub of coding-agent (pi) session logs at rest: a
+    /// background worker strips credentials from `pi/sessions/*.jsonl`
+    /// (idle files only). On-device regex, no model. Off by default;
+    /// independent of `async_pii_redaction`.
+    pub redact_agent_session_secrets: bool,
     /// Async image PII redaction: runs rfdetr_v8 on each captured
     /// frame and blacks out detected PII regions, atomically
     /// overwriting the source JPG. Off by default. First-run
@@ -85,6 +90,8 @@ pub struct RecordingConfig {
     pub windows_input_aec_enabled: bool,
     /// Use Apple VoiceProcessingIO on the default macOS microphone when supported.
     pub macos_input_vpio_enabled: bool,
+    /// Request Screenpipe's software Acoustic Echo Cancellation (via sonora WebRTC AEC3).
+    pub screenpipe_aec_enabled: bool,
     pub monitor_ids: Vec<String>,
     pub use_all_monitors: bool,
 
@@ -254,6 +261,8 @@ impl RecordingConfig {
         // Sync the record_while_locked preference to the shared atomic flag
         // so the audio recording loop can read it without holding a config reference.
         screenpipe_config::set_record_while_locked(settings.record_while_locked);
+        let (screenpipe_aec_enabled, windows_input_aec_enabled, macos_input_vpio_enabled) =
+            settings.effective_aec_flags();
 
         Self {
             audio_chunk_duration: settings.audio_chunk_duration.max(0) as u64,
@@ -265,6 +274,7 @@ impl RecordingConfig {
             disable_timeline: settings.disable_timeline,
             use_pii_removal: settings.use_pii_removal,
             async_pii_redaction: settings.async_pii_redaction,
+            redact_agent_session_secrets: settings.redact_agent_session_secrets,
             async_image_pii_redaction: settings.async_image_pii_redaction,
             pii_backend: settings.pii_backend.clone(),
             pii_redaction_labels: settings.pii_redaction_labels.clone(),
@@ -308,8 +318,9 @@ impl RecordingConfig {
             audio_devices: settings.audio_devices.clone(),
             use_system_default_audio: settings.use_system_default_audio,
             experimental_coreaudio_system_audio: settings.experimental_coreaudio_system_audio,
-            windows_input_aec_enabled: settings.windows_input_aec_enabled,
-            macos_input_vpio_enabled: settings.macos_input_vpio_enabled,
+            windows_input_aec_enabled,
+            macos_input_vpio_enabled,
+            screenpipe_aec_enabled,
             monitor_ids: settings.monitor_ids.clone(),
             use_all_monitors: settings.use_all_monitors,
             ignored_windows: settings.ignored_windows.clone(),
@@ -469,6 +480,7 @@ impl RecordingConfig {
             .experimental_coreaudio_system_audio(self.experimental_coreaudio_system_audio)
             .windows_input_aec_enabled(self.windows_input_aec_enabled)
             .macos_input_vpio_enabled(self.macos_input_vpio_enabled)
+            .screenpipe_aec_enabled(self.screenpipe_aec_enabled)
             .deepgram_config(self.deepgram_config.clone())
             .output_path(output_path)
             .use_pii_removal(self.use_pii_removal)
@@ -578,6 +590,44 @@ mod tests {
         let c = build(&settings_with(false, false));
         assert_eq!(c.listen_address, Ipv4Addr::LOCALHOST);
         assert!(!c.api_auth);
+    }
+
+    #[test]
+    fn aec_mode_produces_one_effective_backend() {
+        let legacy_conflict_without_mode = screenpipe_config::RecordingSettings {
+            screenpipe_aec_enabled: false,
+            windows_input_aec_enabled: true,
+            macos_input_vpio_enabled: true,
+            ..Default::default()
+        };
+        let c = build(&legacy_conflict_without_mode);
+        assert!(!c.screenpipe_aec_enabled);
+        assert!(!c.windows_input_aec_enabled);
+        assert!(!c.macos_input_vpio_enabled);
+
+        let explicit_screenpipe = screenpipe_config::RecordingSettings {
+            aec_mode: screenpipe_config::AecMode::Screenpipe,
+            screenpipe_aec_enabled: false,
+            windows_input_aec_enabled: true,
+            macos_input_vpio_enabled: true,
+            ..Default::default()
+        };
+        let c = build(&explicit_screenpipe);
+        assert!(c.screenpipe_aec_enabled);
+        assert!(!c.windows_input_aec_enabled);
+        assert!(!c.macos_input_vpio_enabled);
+
+        let explicit_macos = screenpipe_config::RecordingSettings {
+            aec_mode: screenpipe_config::AecMode::Macos,
+            screenpipe_aec_enabled: true,
+            windows_input_aec_enabled: true,
+            macos_input_vpio_enabled: false,
+            ..Default::default()
+        };
+        let c = build(&explicit_macos);
+        assert!(!c.screenpipe_aec_enabled);
+        assert!(!c.windows_input_aec_enabled);
+        assert!(c.macos_input_vpio_enabled);
     }
 
     #[test]

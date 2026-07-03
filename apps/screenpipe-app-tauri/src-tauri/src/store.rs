@@ -82,7 +82,11 @@ const APP_ENTITLEMENT_CLOCK_SKEW_MINUTES: i64 = 5;
 //       leave it in place.
 //   L5: after the plugin builds, if the disk file has a `settings` key but
 //       the loaded store doesn't, the load silently failed — refuse to hand
-//       out the wipe-primed handle.
+//       out the wipe-primed handle AND heal the registered instance in
+//       place via reload() (the plugin registers stores before we can
+//       inspect them and serves registry hits without re-reading disk, so
+//       an unhealed instance would be re-served to retries, the webview,
+//       and the exit-time save-all).
 // ---------------------------------------------------------------------------
 
 /// Suffix for the most-recent known-healthy snapshot.
@@ -230,6 +234,7 @@ fn restore_snapshot_over(store_path: &Path, why: &str) -> bool {
     // Keep the bad file for forensics before overwriting it
     let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     let pre_restore = store_path.with_extension(format!("bin.pre-restore-{}", ts));
+    let mut pre_restore_note = String::from("no pre-restore copy (store.bin was absent)");
     if store_path.exists() {
         if let Err(e) = std::fs::copy(store_path, &pre_restore) {
             tracing::warn!(
@@ -240,6 +245,7 @@ fn restore_snapshot_over(store_path: &Path, why: &str) -> bool {
             );
             return false;
         }
+        pre_restore_note = format!("pre-restore copy at {}", pre_restore.display());
     }
 
     if let Err(e) = durable_write(store_path, &data) {
@@ -252,19 +258,20 @@ fn restore_snapshot_over(store_path: &Path, why: &str) -> bool {
         return false;
     }
     tracing::warn!(
-        "settings recovery: {} — restored {} from {}; pre-restore copy at {}",
+        "settings recovery: {} — restored {} from {}; {}",
         why,
         store_path.display(),
         src.display(),
-        pre_restore.display()
+        pre_restore_note
     );
     true
 }
 
-/// L2 — if `store.bin` is degraded (parses but missing aiPresets) and a
-/// snapshot is healthy, restore it before anything else touches the file.
-/// The bad current file is preserved as `.pre-restore-<UTC ts>` so we have
-/// forensics if a user reports the restore was wrong.
+/// L2 — if `store.bin` is degraded (parses but missing aiPresets) or missing
+/// entirely and a snapshot is healthy, restore it before anything else
+/// touches the file. The bad current file (when one exists) is preserved as
+/// `.pre-restore-<UTC ts>` so we have forensics if a user reports the
+/// restore was wrong.
 ///
 /// Returns `true` when a restore happened (telemetry hook).
 pub fn auto_restore_if_wiped(store_path: &Path) -> bool {
@@ -273,6 +280,17 @@ pub fn auto_restore_if_wiped(store_path: &Path) -> bool {
     // keychain key could still open.
     let cur = match std::fs::read(store_path) {
         Ok(d) => d,
+        // Missing entirely (user/cleaner delete, chkdsk quarantining a torn
+        // file to found.000 after an unclean shutdown) is the worst wipe.
+        // A healthy snapshot distinguishes it from a fresh install, which
+        // has no snapshot and must stay quiet. Other errors (permissions,
+        // I/O) are not evidence of a wipe — leave the file alone.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if read_healthy_snapshot(store_path).is_none() {
+                return false;
+            }
+            return restore_snapshot_over(store_path, "store.bin is missing");
+        }
         Err(_) => return false,
     };
     if is_encrypted_bytes(&cur) {
@@ -462,7 +480,9 @@ pub fn reencrypt_store_file(app: &AppHandle) {
         let flag_path = base_dir.join(".encrypt-store");
         let store_path = base_dir.join("store.bin");
 
-        // Read the setting from the store JSON on disk
+        // Read the setting from the store JSON on disk. If the file is missing,
+        // encrypted, or temporarily unparsable, leave the flag unchanged; defaulting
+        // to "on" here silently opts users into repeated re-encryption churn.
         let encrypt_enabled = std::fs::read(&store_path)
             .ok()
             .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
@@ -470,13 +490,14 @@ pub fn reencrypt_store_file(app: &AppHandle) {
                 json.get("settings")
                     .and_then(|s| s.get("encryptStore"))
                     .and_then(|v| v.as_bool())
-            })
-            .unwrap_or(true);
+            });
 
-        if encrypt_enabled && !flag_path.exists() {
-            let _ = std::fs::write(&flag_path, b"");
-        } else if !encrypt_enabled && flag_path.exists() {
-            let _ = std::fs::remove_file(&flag_path);
+        if let Some(encrypt_enabled) = encrypt_enabled {
+            if encrypt_enabled && !flag_path.exists() {
+                let _ = std::fs::write(&flag_path, b"");
+            } else if !encrypt_enabled && flag_path.exists() {
+                let _ = std::fs::remove_file(&flag_path);
+            }
         }
 
         // Durably flush the plugin's non-atomic write of store.bin before we
@@ -521,8 +542,18 @@ static STORE_CACHE: Mutex<Option<Arc<tauri_plugin_store::Store<tauri::Wry>>>> = 
 /// Build (or rebuild) the store, retrying on TOCTOU races and stale resource IDs.
 fn build_store(app: &AppHandle) -> anyhow::Result<Arc<tauri_plugin_store::Store<tauri::Wry>>> {
     let base_dir = get_base_dir(app, None)?;
-    let store_path = base_dir.join("store.bin");
+    build_store_at(app, base_dir.join("store.bin"))
+}
 
+/// Runtime-generic core of [`build_store`]: decrypt, snapshot recovery and
+/// the guarded build-retry loop over an already-resolved store path. Split
+/// out so the recovery layers can be tested against `tauri::test::MockRuntime`
+/// — the registry the L5 guard must clean up lives in tauri-managed state,
+/// unreachable from pure path-based tests.
+fn build_store_at<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    store_path: std::path::PathBuf,
+) -> anyhow::Result<Arc<tauri_plugin_store::Store<R>>> {
     // Decrypt store.bin before the plugin reads it (no-op if plain JSON or keychain unavailable)
     if store_path.exists() && decrypt_store_file(&store_path) == DecryptOutcome::Locked {
         // L2b — the encrypted blob is unreadable (key denied/missing or
@@ -555,13 +586,13 @@ fn build_store(app: &AppHandle) -> anyhow::Result<Arc<tauri_plugin_store::Store<
         }
     }
 
-    // L2 — if the file is degraded (parses but has no aiPresets), restore
-    // from .last-good before the plugin reads it. Runs after decrypt so
-    // we operate on the plain-JSON form. No-op if the current state is
-    // already healthy or no .last-good exists yet.
-    if store_path.exists() {
-        let _ = auto_restore_if_wiped(&store_path);
-    }
+    // L2 — if the file is degraded (parses but has no aiPresets) or missing
+    // entirely (deleted, or quarantined by e.g. chkdsk after an unclean
+    // shutdown), restore from .last-good before the plugin reads it. Runs
+    // after decrypt so we operate on the plain-JSON form. No-op if the
+    // current state is already healthy or no snapshot exists yet (fresh
+    // install).
+    let _ = auto_restore_if_wiped(&store_path);
 
     // L5 precondition — note whether the disk file holds a parseable
     // `settings` key right before the plugin reads it. Compared against the
@@ -596,6 +627,37 @@ fn build_store(app: &AppHandle) -> anyhow::Result<Arc<tauri_plugin_store::Store<
                         store_path.display(),
                         attempt + 1
                     );
+                    // The plugin registered this instance before we could
+                    // inspect it and serves it from the registry on every
+                    // later build — ours AND the webview's — without ever
+                    // re-reading disk, so a bare `continue` would retry into
+                    // the same empty store and the first save would flush
+                    // defaults over the user's data. Heal it in place:
+                    // reload() re-reads the file with errors VISIBLE (build
+                    // swallows them), and fixing the shared instance fixes
+                    // every handle already pointing at it. Deliberately no
+                    // registry ejection — close_resource() takes the
+                    // resources-table and stores-map locks in the opposite
+                    // order to build_inner (ABBA deadlock risk) and would
+                    // invalidate resource ids held by live webview handles.
+                    match s.reload() {
+                        Ok(()) if s.get("settings").is_some() => {
+                            tracing::warn!(
+                                "store healed in place from {} after a \
+                                 silently-swallowed load failure",
+                                store_path.display()
+                            );
+                            encrypt_store_file(&store_path);
+                            return Ok(s);
+                        }
+                        Ok(()) => tracing::error!(
+                            "store reload succeeded but settings key still \
+                             missing — retrying"
+                        ),
+                        Err(e) => {
+                            tracing::error!("store reload from disk failed: {} — retrying", e)
+                        }
+                    }
                     last_err = None;
                     std::thread::sleep(std::time::Duration::from_millis(
                         100 * (attempt as u64 + 1),
@@ -2209,6 +2271,54 @@ mod tests {
     }
 
     #[test]
+    fn auto_restore_recovers_missing_store_from_last_good() {
+        // store.bin deleted/quarantined entirely (user/cleaner delete, chkdsk
+        // moving a torn file to found.000) while a healthy snapshot sits next
+        // to it — must restore, not boot as a fresh install.
+        let tmp = tempfile::tempdir().unwrap();
+        let store_path = tmp.path().join("store.bin");
+        write_last_good(
+            tmp.path(),
+            &json!({"settings": {"aiPresets": presets_n(5)}}),
+        );
+
+        let restored = auto_restore_if_wiped(&store_path);
+        assert!(
+            restored,
+            "missing store.bin with a healthy last-good must restore"
+        );
+
+        let now = std::fs::read(&store_path).unwrap();
+        assert!(
+            store_json_has_presets(&now),
+            "store must be healthy after restore"
+        );
+
+        // Nothing existed to back up, so no pre-restore forensic copy
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().into_string().unwrap_or_default())
+            .filter(|n| n.contains("pre-restore-"))
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "no pre-restore backup expected when store.bin was missing, got {entries:?}"
+        );
+    }
+
+    #[test]
+    fn auto_restore_noop_on_fresh_install() {
+        // No store.bin and no snapshot — a genuinely fresh install. Must not
+        // restore and must not create anything the plugin would read as state.
+        let tmp = tempfile::tempdir().unwrap();
+        let store_path = tmp.path().join("store.bin");
+        let restored = auto_restore_if_wiped(&store_path);
+        assert!(!restored, "fresh install must not trigger a restore");
+        assert!(!store_path.exists(), "must not create store.bin");
+    }
+
+    #[test]
     fn auto_restore_noop_when_current_is_healthy() {
         let tmp = tempfile::tempdir().unwrap();
         let store_path = write_store(
@@ -2414,6 +2524,70 @@ mod tests {
             blob,
             "file must be untouched when there is nothing to restore from"
         );
+    }
+
+    #[test]
+    fn l5_refusal_heals_wipe_primed_store_in_place() {
+        // The plugin's build_inner registers a freshly-built store in its
+        // registry BEFORE build_store can refuse it, and `.build()` serves
+        // registry hits without re-reading disk. If the L5 refusal only
+        // dropped its local Arc, every retry — and the webview's Store.load,
+        // and the plugin's exit-time save-all — would keep getting the same
+        // wipe-primed EMPTY instance, so the first save would flush defaults
+        // over the user's real store.bin. The refusal must reload the SHARED
+        // instance from disk in place: healing it heals every handle already
+        // pointing at it (a webview's included), keeps its resource id valid,
+        // and needs no registry surgery (whose lock order inverts the
+        // plugin's and risks deadlock).
+        use tauri_plugin_store::StoreExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store_path = tmp.path().join("store.bin");
+
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_store::Builder::default().build())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("failed to build mock app");
+
+        // Poison the registry the way a transient read failure does: the
+        // plugin swallows the load error and registers an EMPTY store. This
+        // handle also stands in for one a webview grabbed before recovery.
+        std::fs::write(&store_path, b"transient garbage").unwrap();
+        let poisoned = StoreBuilder::new(app.handle(), store_path.clone())
+            .build()
+            .expect("plugin builds an empty store from an unreadable file");
+        assert!(
+            poisoned.get("settings").is_none(),
+            "precondition: the registered store is empty"
+        );
+
+        // The disk heals underneath it — the user's data was there all along.
+        write_store(
+            tmp.path(),
+            &json!({"settings": {"aiPresets": presets_n(2)}}),
+        );
+
+        let store = build_store_at(app.handle(), store_path.clone())
+            .expect("must heal the poisoned instance from the disk state");
+        assert!(
+            store.get("settings").is_some(),
+            "must hand out the on-disk settings, not the wipe-primed empty store"
+        );
+        assert!(
+            Arc::ptr_eq(&poisoned, &store),
+            "must heal the shared registered instance, not swap in a new one"
+        );
+        assert!(
+            poisoned.get("settings").is_some(),
+            "handles obtained before recovery must see the healed state"
+        );
+
+        // The registry — what the webview's Store.load and the plugin's
+        // exit-time save-all read — must also serve the healthy instance.
+        let registered = app
+            .get_store(&store_path)
+            .expect("healthy store must be registered");
+        assert!(Arc::ptr_eq(&registered, &store));
     }
 
     // ---- Existing tests ----

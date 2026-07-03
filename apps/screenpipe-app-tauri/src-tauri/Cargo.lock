@@ -10927,7 +10927,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-app"
-version = "2.5.76"
+version = "2.5.89"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -10944,6 +10944,7 @@ dependencies = [
  "chrono",
  "cocoa 0.26.1",
  "core-foundation 0.10.1",
+ "core-foundation-sys 0.8.7",
  "core-graphics-helmer-fork",
  "dark-light",
  "dirs 5.0.1",
@@ -11048,7 +11049,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-audio"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "anyhow",
  "audiopipe",
@@ -11090,6 +11091,7 @@ dependencies = [
  "screenpipe-events",
  "serde",
  "serde_json",
+ "sonora",
  "symphonia",
  "sysinfo",
  "tokio",
@@ -11101,6 +11103,7 @@ dependencies = [
  "which 7.0.3",
  "whisper-rs",
  "windows 0.58.0",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -11123,7 +11126,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-config"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "dirs 6.0.0",
  "serde",
@@ -11135,7 +11138,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-connect"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11176,7 +11179,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-core"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "accessibility",
  "accessibility-sys",
@@ -11227,7 +11230,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-db"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11245,6 +11248,7 @@ dependencies = [
  "sqlite-vec",
  "sqlx",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "zerocopy 0.7.35",
@@ -11252,7 +11256,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-engine"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -11319,7 +11323,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-events"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11335,7 +11339,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-redact"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -11370,7 +11374,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-rfdetr-mlx"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "image 0.25.10",
  "mlx-rs",
@@ -11381,7 +11385,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-screen"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "accessibility-sys",
  "anyhow",
@@ -11435,7 +11439,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-sync"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -11455,7 +11459,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-vault"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -12412,6 +12416,72 @@ dependencies = [
  "wasm-bindgen",
  "web-sys",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sonora"
+version = "0.1.0"
+source = "git+https://github.com/dignifiedquire/sonora.git?rev=70c673606e1db8442a8ba20659b2bc7355555274#70c673606e1db8442a8ba20659b2bc7355555274"
+dependencies = [
+ "sonora-aec3",
+ "sonora-agc2",
+ "sonora-common-audio",
+ "sonora-ns",
+ "sonora-simd",
+ "tracing",
+]
+
+[[package]]
+name = "sonora-aec3"
+version = "0.1.0"
+source = "git+https://github.com/dignifiedquire/sonora.git?rev=70c673606e1db8442a8ba20659b2bc7355555274#70c673606e1db8442a8ba20659b2bc7355555274"
+dependencies = [
+ "sonora-common-audio",
+ "sonora-fft",
+ "sonora-simd",
+]
+
+[[package]]
+name = "sonora-agc2"
+version = "0.1.0"
+source = "git+https://github.com/dignifiedquire/sonora.git?rev=70c673606e1db8442a8ba20659b2bc7355555274#70c673606e1db8442a8ba20659b2bc7355555274"
+dependencies = [
+ "bytemuck",
+ "derive_more 2.1.1",
+ "sonora-common-audio",
+ "sonora-fft",
+ "sonora-simd",
+ "tracing",
+]
+
+[[package]]
+name = "sonora-common-audio"
+version = "0.1.0"
+source = "git+https://github.com/dignifiedquire/sonora.git?rev=70c673606e1db8442a8ba20659b2bc7355555274#70c673606e1db8442a8ba20659b2bc7355555274"
+dependencies = [
+ "derive_more 2.1.1",
+ "sonora-simd",
+]
+
+[[package]]
+name = "sonora-fft"
+version = "0.1.0"
+source = "git+https://github.com/dignifiedquire/sonora.git?rev=70c673606e1db8442a8ba20659b2bc7355555274#70c673606e1db8442a8ba20659b2bc7355555274"
+
+[[package]]
+name = "sonora-ns"
+version = "0.1.0"
+source = "git+https://github.com/dignifiedquire/sonora.git?rev=70c673606e1db8442a8ba20659b2bc7355555274#70c673606e1db8442a8ba20659b2bc7355555274"
+dependencies = [
+ "sonora-fft",
+]
+
+[[package]]
+name = "sonora-simd"
+version = "0.1.0"
+source = "git+https://github.com/dignifiedquire/sonora.git?rev=70c673606e1db8442a8ba20659b2bc7355555274#70c673606e1db8442a8ba20659b2bc7355555274"
+dependencies = [
+ "cpufeatures 0.3.0",
 ]
 
 [[package]]

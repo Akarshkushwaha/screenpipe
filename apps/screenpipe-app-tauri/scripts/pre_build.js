@@ -23,6 +23,16 @@ const winArch = platform === 'windows' ? (process.arch === 'arm64' ? 'arm64' : '
 const cwd = process.cwd()
 console.log('cwd', cwd)
 
+// Remove any stale static export before the frontend rebuilds. `next build`
+// (output: 'export') only writes ../out on success; if it fails (e.g. a type
+// error), a previously-built out/ stays on disk and tauri embeds that OLD
+// bundle — so the app "builds" but silently ships a stale UI. Clearing it here
+// (prebuild runs before `next build`) means a failed build leaves no out/ and
+// tauri fails loudly on the missing frontendDist instead. See #4645 post-mortem.
+const staleExportDir = path.join(cwd, '..', 'out')
+await fs.rm(staleExportDir, { recursive: true, force: true })
+console.log('cleared stale frontend export:', staleExportDir)
+
 
 const config = {
 	ffmpegRealname: 'ffmpeg',
@@ -165,18 +175,10 @@ async function copyBunBinary() {
 			return;
 		}
 
-		if (process.env.CI === 'true' || process.env.GITHUB_ACTIONS === 'true') {
-			const systemBun = await findOnPath('bun');
-			if (!systemBun) {
-				throw new Error('CI expected bun on PATH, but command lookup failed');
-			}
-			console.log(`using CI bun binary for tauri sidecar: ${systemBun}`);
-			await copyFile(systemBun, bunDest1);
-			return;
-		}
-
 		// Download the baseline bun variant for broader glibc compatibility.
-		// Use npm's tarball mirror because GitHub release assets can 504.
+		// Use npm's tarball mirror because GitHub release assets can 504. Do
+		// this in CI too; the runner's bun can be a host-optimized binary, but
+		// the AppImage sidecar needs to run on older and different Linux hosts.
 		const bunVersion = '1.3.10';
 		const baselineUrl = `https://registry.npmjs.org/@oven/bun-linux-x64-baseline/-/bun-linux-x64-baseline-${bunVersion}.tgz`;
 		console.log(`downloading bun baseline v${bunVersion} for linux...`);
@@ -316,7 +318,11 @@ async function downloadStaticLinuxFfmpeg() {
 		}
 	}
 
-	await $`wget --no-config ${config.linux.ffmpegUrl} -O ${archive}`
+	// johnvansickle.com intermittently returns a transient HTTP 415 (and the odd
+	// 5xx). downloadFile() retries on any curl failure — including HTTP error
+	// codes via curl -f — so those transient responses fall inside the retry
+	// budget instead of hard-failing the build.
+	await downloadFile(config.linux.ffmpegUrl, archive, { retries: 5, timeoutMs: 120000 })
 	await $`tar xf ${archive}`
 
 	const entries = await fs.readdir(cwd, { withFileTypes: true });
@@ -327,6 +333,37 @@ async function downloadStaticLinuxFfmpeg() {
 
 	await fs.rename(path.join(cwd, extracted.name), config.ffmpegRealname)
 	await fs.rm(archive, { force: true })
+}
+
+async function copySystemLinuxFfmpeg() {
+	await fs.rm(config.ffmpegRealname, { recursive: true, force: true });
+	await fs.mkdir(config.ffmpegRealname, { recursive: true });
+	await copySystemBinary('ffmpeg', path.join(config.ffmpegRealname, 'ffmpeg'));
+	await copySystemBinary('ffprobe', path.join(config.ffmpegRealname, 'ffprobe'));
+
+	const qtFaststartDest = path.join(config.ffmpegRealname, 'qt-faststart');
+	const qtFaststart = await findOnPath('qt-faststart');
+	if (qtFaststart) {
+		await copyFile(qtFaststart, qtFaststartDest);
+		console.log(`using system qt-faststart: ${qtFaststart} -> ${qtFaststartDest}`);
+		return;
+	}
+
+	await fs.writeFile(
+		qtFaststartDest,
+		`#!/usr/bin/env sh
+set -eu
+
+if [ "$#" -lt 2 ]; then
+  echo "usage: qt-faststart input output" >&2
+  exit 2
+fi
+
+exec "$(dirname "$0")/ffmpeg" -y -i "$1" -c copy -movflags faststart "$2"
+`
+	);
+	await fs.chmod(qtFaststartDest, 0o755);
+	console.log(`created ffmpeg-backed qt-faststart wrapper at ${qtFaststartDest}`);
 }
 
 async function copySystemBinary(binaryName, destination) {
@@ -549,14 +586,19 @@ if (platform == 'linux') {
 		if (await fs.exists(config.ffmpegRealname)) {
 			await fs.rm(config.ffmpegRealname, { recursive: true, force: true });
 		}
-		await downloadStaticLinuxFfmpeg();
+		try {
+			await downloadStaticLinuxFfmpeg();
+		} catch (error) {
+			console.warn(`static Linux ffmpeg download failed (${error.message}); falling back to system ffmpeg`);
+			await copySystemLinuxFfmpeg();
+		}
 	} else {
 		console.log('FFMPEG already exists');
 	}
 		// Setup TESSERACT
 	if (!(await fs.exists(config.linux.tesseractName)) || (await isSymlink(config.linux.tesseractName))) {
 		await fs.rm(config.linux.tesseractName, { force: true });
-		await $`wget --no-config -nc ${config.linux.tesseractUrl} -O ${config.linux.tesseractName}`
+		await $`wget --no-config -nc --tries=5 --waitretry=10 --retry-on-http-error=415,429,500,502,503,504 --timeout=60 ${config.linux.tesseractUrl} -O ${config.linux.tesseractName}`
 		await $`chmod +x ${config.linux.tesseractName}` // Make the Tesseract binary executable
 	} else {
 		console.log('TESSERACT already exists');
@@ -714,7 +756,7 @@ if (platform == 'windows') {
 			const arm64Url = asset.browser_download_url
 			const arm64Filename = asset.name
 			console.log(`ffmpeg ARM64: ${arm64Url}`)
-			await downloadFile(arm64Url, arm64Filename, { retries: 10, timeoutMs: 120000 })
+			await downloadFile(arm64Url, arm64Filename, { retries: 10, timeoutMs: 900000 })
 			await $`${sevenZ} x ${arm64Filename}`
 			// tordona 7z extracts to a single folder; move its contents to ffmpeg (or rename if single top-level dir)
 			const entries = await fs.readdir(cwd, { withFileTypes: true })
@@ -730,7 +772,7 @@ if (platform == 'windows') {
 			}
 			await fs.rm(path.join(cwd, arm64Filename), { force: true }).catch(() => {})
 		} else {
-			await downloadFile(config.windows.ffmpegUrl, `${config.windows.ffmpegName}.7z`, { retries: 10, timeoutMs: 120000 })
+			await downloadFile(config.windows.ffmpegUrl, `${config.windows.ffmpegName}.7z`, { retries: 10, timeoutMs: 900000 })
 			await $`${sevenZ} x ${config.windows.ffmpegName}.7z`
 			await $`mv ${config.windows.ffmpegName} ${config.ffmpegRealname}`
 			await $`rm -rf ${config.windows.ffmpegName}.7z`

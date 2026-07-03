@@ -10,7 +10,7 @@ import { mountAgentEventBus, onTerminated as onAgentTerminated } from "@/lib/eve
 import { commands } from "@/lib/utils/tauri";
 import { useChatStore } from "@/lib/stores/chat-store";
 import { statusForEvent } from "@/lib/stores/pi-event-router";
-import { extractConversationHistorySyncUserText } from "@/lib/chat-utils";
+import { extractInjectedUserText } from "@/lib/chat-utils";
 import { imageDataUrlsFromPiContent } from "@/lib/chat/image-content";
 import { buildDailyLimitMessage, buildRateLimitMessage, classifyQuotaError, parseRateLimitWaitSeconds, PI_MAX_RATE_LIMIT_RETRIES } from "@/lib/chat/quota-errors";
 import { buildInvalidatedAuthTokenMessage, isInvalidatedAuthTokenError } from "@/lib/chat/auth-errors";
@@ -336,6 +336,7 @@ export function usePiForegroundEvents({
               toolName: stringValue(data.toolName, "unknown"),
               args: isRecord(data.args) ? data.args : {},
               isRunning: true,
+              startedAtMs: Date.now(),
             };
             // Add tool block (text before it is already its own block)
             piContentBlocksRef.current.push({ type: "tool", toolCall });
@@ -358,6 +359,7 @@ export function usePiForegroundEvents({
                 block.toolCall.isRunning = false;
                 block.toolCall.result = truncated;
                 block.toolCall.isError = data.isError === true;
+                block.toolCall.endedAtMs = Date.now();
               }
             }
             const contentBlocks = [...piContentBlocksRef.current];
@@ -368,12 +370,15 @@ export function usePiForegroundEvents({
         } else if (data.type === "auto_retry_end" && data.success === false) {
           // Pi exhausted retries on a transient error (rate limit, overloaded, etc.)
           const errorStr = stringValue(data.finalError, "Request failed after retries");
-          console.error("[Pi] Auto-retry failed:", errorStr);
+          const quotaErrorType = classifyQuotaError(errorStr);
+          const logAutoRetryFailure = quotaErrorType === "daily" || quotaErrorType === "rate" || errorStr.includes("model_not_allowed")
+            ? console.warn
+            : console.error;
+          logAutoRetryFailure("[Pi] Auto-retry failed:", errorStr);
           piLastErrorRef.current = errorStr;
           emitSessionActivity({ status: "error", lastError: errorStr });
 
           // Detect rate limit or daily limit from the error
-          const quotaErrorType = classifyQuotaError(errorStr);
           if (quotaErrorType === "daily" || quotaErrorType === "rate") {
             if (quotaErrorType === "daily") {
               posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
@@ -479,7 +484,7 @@ export function usePiForegroundEvents({
           }
 
           const rawText = textFromMessageContent(data.message?.content);
-          const text = extractConversationHistorySyncUserText(rawText) ?? rawText;
+          const text = extractInjectedUserText(rawText) ?? rawText;
           const eventImages = imageDataUrlsFromPiContent(data.message?.content);
           const pendingOptimisticSteer = optimisticSteerRef.current;
           const isPendingOptimisticSteerEcho = Boolean(
@@ -598,7 +603,11 @@ export function usePiForegroundEvents({
                    data.message?.role === "assistant" && data.message?.stopReason === "error") {
           // LLM returned an error (credits_exhausted, rate limit, provider error, etc.)
           const errMsg = stringValue(data.message.errorMessage, stringValue(data.message.error, "Unknown error"));
-          console.error("[Pi] LLM error via", data.type, ":", errMsg);
+          const quotaErrorType = classifyQuotaError(errMsg);
+          const logLlmError = quotaErrorType === "daily" || quotaErrorType === "rate" || errMsg.includes("model_not_allowed")
+            ? console.warn
+            : console.error;
+          logLlmError("[Pi] LLM error via", data.type, ":", errMsg);
           piLastErrorRef.current = errMsg;
           emitSessionActivity({ status: "error", lastError: errMsg });
           const authTokenInvalidated = isInvalidatedAuthTokenError(errMsg);
@@ -609,7 +618,6 @@ export function usePiForegroundEvents({
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
 
-            const quotaErrorType = classifyQuotaError(errMsg);
             const providerError = buildProviderErrorMessage(errMsg, getActivePreset());
             if (authTokenInvalidated) {
               setMessages((prev) =>
@@ -705,6 +713,7 @@ export function usePiForegroundEvents({
                 existing?.content?.includes("requires an upgrade") ||
                 existing?.content?.includes("Rate limited") ||
                 existing?.content?.includes("rate limit") ||
+                existing?.content?.includes("chat is too long") ||
                 existing?.content?.startsWith("Error:");
               if (isErrorMessage) {
                 return prev;
@@ -748,7 +757,18 @@ export function usePiForegroundEvents({
                 contentBlocks.push({ type: "text", text: content });
               }
               return prev.map((m) => m.id === msgId
-                ? { ...m, content, contentBlocks, ...(emptyResponseRetryPrompt ? { retryPrompt: emptyResponseRetryPrompt } : {}) }
+                ? {
+                    ...m,
+                    content,
+                    contentBlocks,
+                    ...(wasStoppedByUser
+                      ? {
+                          workDurationMs: Math.max(1, Date.now() - m.timestamp),
+                          stoppedByUser: true,
+                        }
+                      : {}),
+                    ...(emptyResponseRetryPrompt ? { retryPrompt: emptyResponseRetryPrompt } : {}),
+                  }
                 : m);
             });
             if (!isPipeWatch) {
