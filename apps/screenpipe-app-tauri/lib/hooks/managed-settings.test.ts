@@ -116,4 +116,58 @@ describe("computeManagedSettingUpdates", () => {
     expect(r.engineChanged).toBe(true); // vision/audio/engine changed
     expect(r.liveChanged).toBe(true);
   });
+
+  it("differentiates server restart (disableAudio) vs capture restart (disableVision)", () => {
+    const r = computeManagedSettingUpdates(
+      { disableAudio: "true", disableVision: "true" },
+      { disableAudio: false, disableVision: false },
+    );
+    expect(r.serverRestartNeeded).toBe(true);
+    expect(r.captureRestartNeeded).toBe(true);
+    expect(r.serverRestartUpdates.disableAudio).toBe(true);
+    expect(r.captureRestartUpdates.disableVision).toBe(true);
+  });
+
+  it("forces apiAuth to true when listen_on_lan is true (server restart needed)", () => {
+    const r = computeManagedSettingUpdates(
+      { listen_on_lan: "true" },
+      { listenOnLan: false, apiAuth: false },
+    );
+    expect(r.serverRestartUpdates.listenOnLan).toBe(true);
+    expect(r.serverRestartUpdates.apiAuth).toBe(true);
+    expect(r.serverRestartNeeded).toBe(true);
+  });
+
+  it("enforces PII policy (usePiiRemoval, piiBackend, piiRedactionLabels) with correct restart types", () => {
+    const r = computeManagedSettingUpdates(
+      {
+        usePiiRemoval: "true",
+        piiBackend: "tinfoil",
+        piiRedactionLabels: ["email", "phone"],
+      },
+      {
+        usePiiRemoval: false,
+        piiBackend: "local",
+        piiRedactionLabels: ["secret"],
+      },
+    );
+    expect(r.serverRestartUpdates.piiBackend).toBe("tinfoil");
+    expect(r.serverRestartNeeded).toBe(true); // piiBackend needs server restart
+    expect(r.captureRestartUpdates.usePiiRemoval).toBe(true);
+    expect(r.captureRestartUpdates.piiRedactionLabels).toEqual([
+      "email",
+      "phone",
+      "secret",
+    ]);
+    expect(r.captureRestartNeeded).toBe(true); // removal & labels need capture restart
+  });
+
+  it("does not flag captureRestartNeeded when piiRedactionLabels match regardless of order", () => {
+    const r = computeManagedSettingUpdates(
+      { piiRedactionLabels: ["phone", "email"] },
+      { piiRedactionLabels: ["email", "secret", "phone"] },
+    );
+    expect(r.captureRestartNeeded).toBe(false);
+  });
 });
+

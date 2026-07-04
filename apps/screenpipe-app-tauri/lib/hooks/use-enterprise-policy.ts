@@ -315,55 +315,121 @@ async function applyPiiPolicy(lockedSettings: Record<string, unknown>): Promise<
 }
 
 /**
- * Apply enterprise-forced managed settings to the local settings store so the
- * recording engine honors them. Engine-spawn settings (capture toggles, LAN
- * bind, transcription engine) only take effect at spawn, so a forced change
- * restarts the engine once; live settings (analytics) don't. The matching UI
- * controls are disabled separately so the employee can't override a forced value.
+ * Serialized and debounced restart queue for enterprise managed settings.
+ * Ensures overlapping or rapid policy polls do not stack stop/start cycles.
  */
-let managedSettingsRestartInFlight = false;
+export let scheduledRestartType: "server" | "capture" | null = null;
+export let restartTimeoutId: ReturnType<typeof setTimeout> | null = null;
+export let restartPromise: Promise<void> = Promise.resolve();
 
-async function applyManagedDeviceSettings(lockedSettings: Record<string, unknown>): Promise<void> {
+export function _getManagedRestartPromiseForTesting(): Promise<void> {
+  return restartPromise;
+}
+
+export function _resetManagedRestartStateForTesting(): void {
+  scheduledRestartType = null;
+  if (restartTimeoutId !== null) {
+    clearTimeout(restartTimeoutId);
+    restartTimeoutId = null;
+  }
+  restartPromise = Promise.resolve();
+}
+
+export function scheduleManagedRestart(
+  type: "server" | "capture",
+  debounceMs = 500,
+  commandTimeoutMs = ENGINE_RESTART_COMMAND_TIMEOUT_MS
+): void {
+  if (scheduledRestartType !== "server") {
+    scheduledRestartType = type;
+  }
+
+  if (restartTimeoutId !== null) {
+    clearTimeout(restartTimeoutId);
+  }
+
+  restartTimeoutId = setTimeout(() => {
+    restartTimeoutId = null;
+    const currentType = scheduledRestartType;
+    scheduledRestartType = null;
+    if (!currentType) return;
+
+    restartPromise = restartPromise.then(async () => {
+      try {
+        if (currentType === "server") {
+          console.log("[enterprise] performing managed server restart...");
+          await withTimeout(
+            "enterprise managed stopScreenpipe",
+            commands.stopScreenpipe(),
+            commandTimeoutMs
+          );
+          await new Promise((resolve) => setTimeout(resolve, Math.min(1000, commandTimeoutMs)));
+          await withTimeout(
+            "enterprise managed spawnScreenpipe",
+            commands.spawnScreenpipe(null),
+            commandTimeoutMs
+          );
+        } else {
+          console.log("[enterprise] performing managed capture restart...");
+          await withTimeout(
+            "enterprise managed stopCapture",
+            commands.stopCapture(),
+            commandTimeoutMs
+          );
+          await new Promise((resolve) => setTimeout(resolve, Math.min(500, commandTimeoutMs)));
+          await withTimeout(
+            "enterprise managed startCapture",
+            commands.startCapture(),
+            commandTimeoutMs
+          );
+        }
+      } catch (e) {
+        console.error(`[enterprise] failed during managed ${currentType} restart:`, e);
+      }
+    });
+  }, debounceMs);
+}
+
+/**
+ * Apply enterprise-forced managed settings (audio, vision, PII, input capture, LAN,
+ * transcription engine, analytics) to the local settings store so the recording engine
+ * honors them. Server settings (e.g. LAN bind, disableAudio, piiBackend) trigger a
+ * debounced server restart; capture settings (e.g. disableVision, piiRedactionLabels)
+ * trigger a debounced capture restart; live settings (analytics) need no restart.
+ * Steady-state polls where local store already matches policy are no-ops.
+ */
+export async function applyManagedDeviceSettings(lockedSettings: Record<string, unknown>): Promise<void> {
   const store = await getStore();
   const settings = (await store.get<Record<string, unknown>>("settings")) || {};
-  const { engineUpdates, liveUpdates, engineChanged, liveChanged } = computeManagedSettingUpdates(
-    lockedSettings,
-    settings,
-  );
+  const {
+    serverRestartUpdates,
+    captureRestartUpdates,
+    liveUpdates,
+    serverRestartNeeded,
+    captureRestartNeeded,
+    liveChanged,
+  } = computeManagedSettingUpdates(lockedSettings, settings);
 
-  if (!engineChanged && !liveChanged) return;
+  if (!serverRestartNeeded && !captureRestartNeeded && !liveChanged) return;
 
-  await store.set("settings", { ...settings, ...engineUpdates, ...liveUpdates });
+  const allUpdates = { ...serverRestartUpdates, ...captureRestartUpdates, ...liveUpdates };
+  await store.set("settings", { ...settings, ...allUpdates });
   await store.save();
   console.log(
-    `[enterprise] managed settings applied: ${Object.entries({ ...engineUpdates, ...liveUpdates })
-      .map(([k, v]) => `${k}=${v}`)
-      .join(", ")}${engineChanged ? " — restarting engine" : " (no restart needed)"}`,
+    `[enterprise] managed settings applied: ${Object.entries(allUpdates)
+      .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+      .join(", ")}${
+      serverRestartNeeded
+        ? " — scheduling server restart"
+        : captureRestartNeeded
+        ? " — scheduling capture restart"
+        : " (no restart needed)"
+    }`,
   );
 
-  // Live-only change (e.g. analytics) needs no restart.
-  if (!engineChanged) return;
+  if (!serverRestartNeeded && !captureRestartNeeded) return;
 
-  // Restart so the forced values take effect without waiting for the employee to
-  // restart manually. Guarded so overlapping policy polls don't stack restarts;
-  // steady-state polls are no-ops because the store already matches the policy.
-  if (managedSettingsRestartInFlight) return;
-  managedSettingsRestartInFlight = true;
-  try {
-    await withTimeout(
-      "enterprise input capture stopScreenpipe",
-      commands.stopScreenpipe(),
-      ENGINE_RESTART_COMMAND_TIMEOUT_MS
-    );
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    await withTimeout(
-      "enterprise input capture spawnScreenpipe",
-      commands.spawnScreenpipe(null),
-      ENGINE_RESTART_COMMAND_TIMEOUT_MS
-    );
-  } finally {
-    managedSettingsRestartInFlight = false;
-  }
+  scheduleManagedRestart(serverRestartNeeded ? "server" : "capture");
 }
 
 /**
@@ -625,23 +691,12 @@ export function useEnterprisePolicy() {
         console.warn("[enterprise] failed to apply app update policy:", e);
       }
 
-      // Apply enterprise-forced PII redaction (master / local-vs-cloud backend /
-      // categories) to the settings store so the recording engine honors them.
-      try {
-        await applyPiiPolicy(result.lockedSettings);
-        console.log(
-          `[enterprise] applied PII policy: locked=[${["usePiiRemoval", "piiBackend", "piiRedactionLabels"].filter((k) => k in result.lockedSettings).join(",")}]`
-        );
-      } catch (e) {
-        console.warn("[enterprise] failed to apply PII policy:", e);
-      }
-
-      // Apply enterprise-forced input capture (keyboard / click rows).
-      // Restarts the engine when a forced value actually changed.
+      // Apply enterprise-forced managed settings (audio, vision, PII, input capture, LAN,
+      // transcription engine, analytics). Restarts server or capture when forced values change.
       try {
         await applyManagedDeviceSettings(result.lockedSettings);
       } catch (e) {
-        console.warn("[enterprise] failed to apply input capture policy:", e);
+        console.warn("[enterprise] failed to apply managed device settings:", e);
       }
 
       // Fire-and-forget heartbeat
@@ -917,12 +972,18 @@ export function useEnterprisePolicy() {
     [policy.hiddenSections]
   );
   const checkLocked = useCallback(
-    (settingKey: string) => settingKey in policy.lockedSettings,
+    (settingKey: string) =>
+      settingKey in policy.lockedSettings ||
+      (settingKey === "listenOnLan" && "listen_on_lan" in policy.lockedSettings) ||
+      (settingKey === "listen_on_lan" && "listenOnLan" in policy.lockedSettings),
     [policy.lockedSettings]
   );
   const getManagedValue = useCallback(
     (settingKey: string): string | undefined => {
-      const val = policy.lockedSettings[settingKey];
+      const val =
+        policy.lockedSettings[settingKey] ??
+        (settingKey === "listenOnLan" ? policy.lockedSettings["listen_on_lan"] : undefined) ??
+        (settingKey === "listen_on_lan" ? policy.lockedSettings["listenOnLan"] : undefined);
       return typeof val === "string" ? val : undefined;
     },
     [policy.lockedSettings]

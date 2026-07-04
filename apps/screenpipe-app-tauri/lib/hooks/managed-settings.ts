@@ -24,18 +24,29 @@ export const ALLOWED_TRANSCRIPTION_ENGINES = new Set([
   "whisper-tiny-quantized",
 ]);
 
-// website policy key -> device settings-store key. Most match; `listen_on_lan`
-// (snake_case in the policy) maps to `listenOnLan` on the device.
-export const ENGINE_BOOL_POLICY_KEYS: Record<string, string> = {
+// Bool policy keys that require a FULL SERVER RESTART (stopScreenpipe + spawnScreenpipe)
+export const SERVER_RESTART_BOOL_POLICY_KEYS: Record<string, string> = {
+  disableAudio: "disableAudio",
+  listen_on_lan: "listenOnLan",
+};
+
+// Bool policy keys that require a CAPTURE RESTART (stopCapture + startCapture)
+export const CAPTURE_RESTART_BOOL_POLICY_KEYS: Record<string, string> = {
   disableKeyboardCapture: "disableKeyboardCapture",
   disableClickCapture: "disableClickCapture",
-  disableAudio: "disableAudio",
   disableVision: "disableVision",
   disableScreenshots: "disableScreenshots",
   disableTimeline: "disableTimeline",
   disableSnapshotCompaction: "disableSnapshotCompaction",
   disableMeetingDetector: "disableMeetingDetector",
-  listen_on_lan: "listenOnLan",
+  usePiiRemoval: "usePiiRemoval",
+};
+
+// website policy key -> device settings-store key. Most match; `listen_on_lan`
+// (snake_case in the policy) maps to `listenOnLan` on the device.
+export const ENGINE_BOOL_POLICY_KEYS: Record<string, string> = {
+  ...SERVER_RESTART_BOOL_POLICY_KEYS,
+  ...CAPTURE_RESTART_BOOL_POLICY_KEYS,
 };
 
 // device-key -> app default, so forcing a value that already equals the effective
@@ -50,15 +61,32 @@ export const ENGINE_BOOL_DEFAULTS: Record<string, boolean> = {
   disableSnapshotCompaction: false,
   disableMeetingDetector: false,
   listenOnLan: false,
+  usePiiRemoval: true,
+  apiAuth: true,
 };
 
 export interface ManagedSettingUpdates {
-  /** engine-spawn settings — a change requires a one-time engine restart */
-  engineUpdates: Record<string, boolean | string>;
+  /** settings that require a full server restart (stopScreenpipe + spawnScreenpipe) */
+  serverRestartUpdates: Record<string, unknown>;
+  /** settings that require a capture restart (stopCapture + startCapture) */
+  captureRestartUpdates: Record<string, unknown>;
   /** live settings (analytics) — applied without a restart */
   liveUpdates: Record<string, boolean>;
-  engineChanged: boolean;
+  serverRestartNeeded: boolean;
+  captureRestartNeeded: boolean;
   liveChanged: boolean;
+  /** backward-compatibility aliases */
+  engineUpdates: Record<string, unknown>;
+  engineChanged: boolean;
+}
+
+function areSortedStringArraysEqual(a: unknown[], b: unknown[]): boolean {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length)
+    return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
 
 /**
@@ -69,32 +97,113 @@ export function computeManagedSettingUpdates(
   locked: Record<string, unknown>,
   current: Record<string, unknown>,
 ): ManagedSettingUpdates {
-  const engineUpdates: Record<string, boolean | string> = {};
+  const serverRestartUpdates: Record<string, unknown> = {};
+  const captureRestartUpdates: Record<string, unknown> = {};
   const liveUpdates: Record<string, boolean> = {};
 
-  for (const [policyKey, deviceKey] of Object.entries(ENGINE_BOOL_POLICY_KEYS)) {
+  // 1. Server restart boolean policies (disableAudio, listen_on_lan)
+  for (const [policyKey, deviceKey] of Object.entries(
+    SERVER_RESTART_BOOL_POLICY_KEYS,
+  )) {
     const raw = locked[policyKey];
-    if (raw === "true" || raw === "false") engineUpdates[deviceKey] = raw === "true";
+    if (raw === "true" || raw === "false")
+      serverRestartUpdates[deviceKey] = raw === "true";
   }
 
+  // When listen_on_lan is forced ON, apiAuth must remain forced ON
+  if (serverRestartUpdates.listenOnLan === true) {
+    serverRestartUpdates.apiAuth = true;
+  }
+
+  // PII Backend (local vs tinfoil) - requires server restart (--pii-backend CLI flag)
+  const piiBackend = locked.piiBackend;
+  if (piiBackend === "local" || piiBackend === "tinfoil") {
+    serverRestartUpdates.piiBackend = piiBackend;
+  }
+
+  // 2. Capture restart boolean policies (disableVision, disableMeetingDetector, usePiiRemoval, etc.)
+  for (const [policyKey, deviceKey] of Object.entries(
+    CAPTURE_RESTART_BOOL_POLICY_KEYS,
+  )) {
+    const raw = locked[policyKey];
+    if (raw === "true" || raw === "false")
+      captureRestartUpdates[deviceKey] = raw === "true";
+  }
+
+  // Audio Transcription Engine - requires capture restart
   const engine = locked.audioTranscriptionEngine;
-  if (typeof engine === "string" && engine !== "" && ALLOWED_TRANSCRIPTION_ENGINES.has(engine)) {
-    engineUpdates.audioTranscriptionEngine = engine;
+  if (
+    typeof engine === "string" &&
+    engine !== "" &&
+    ALLOWED_TRANSCRIPTION_ENGINES.has(engine)
+  ) {
+    captureRestartUpdates.audioTranscriptionEngine = engine;
   }
 
+  // PII Redaction Labels - requires capture restart
+  const labels = locked.piiRedactionLabels;
+  if (Array.isArray(labels)) {
+    const clean = Array.from(
+      new Set(labels.filter((l): l is string => typeof l === "string")),
+    );
+    if (!clean.includes("secret")) clean.push("secret");
+    captureRestartUpdates.piiRedactionLabels = clean;
+  }
+
+  // 3. Live settings (analytics)
   const analytics = locked.analyticsEnabled;
   if (analytics === "true" || analytics === "false") {
     liveUpdates.analyticsEnabled = analytics === "true";
   }
 
+  // Helper to determine the effective current setting (fallback to default if undefined in current store)
   const effective = (key: string): unknown => {
     if (current[key] !== undefined) return current[key];
     if (key in ENGINE_BOOL_DEFAULTS) return ENGINE_BOOL_DEFAULTS[key];
+    if (key === "piiBackend") return "local";
+    if (key === "piiRedactionLabels") return ["secret"];
+    if (key === "audioTranscriptionEngine")
+      return "whisper-large-v3-turbo-quantized";
     if (key === "analyticsEnabled") return true;
-    return undefined; // transcription engine: no assumed default → any forced value is a change
+    return undefined;
   };
 
-  const engineChanged = Object.entries(engineUpdates).some(([k, v]) => effective(k) !== v);
-  const liveChanged = Object.entries(liveUpdates).some(([k, v]) => effective(k) !== v);
-  return { engineUpdates, liveUpdates, engineChanged, liveChanged };
+  const serverRestartNeeded = Object.entries(serverRestartUpdates).some(
+    ([k, v]) => {
+      return effective(k) !== v;
+    },
+  );
+
+  const captureRestartNeeded = Object.entries(captureRestartUpdates).some(
+    ([k, v]) => {
+      const eff = effective(k);
+      if (Array.isArray(eff) && Array.isArray(v)) {
+        const sortedEff = eff.slice().sort();
+        const sortedV = v.slice().sort();
+        return !areSortedStringArraysEqual(sortedEff, sortedV);
+      }
+      return eff !== v;
+    },
+  );
+
+  const liveChanged = Object.entries(liveUpdates).some(
+    ([k, v]) => effective(k) !== v,
+  );
+
+  const engineUpdates: Record<string, unknown> = {
+    ...serverRestartUpdates,
+    ...captureRestartUpdates,
+  };
+  const engineChanged = serverRestartNeeded || captureRestartNeeded;
+
+  return {
+    serverRestartUpdates,
+    captureRestartUpdates,
+    liveUpdates,
+    serverRestartNeeded,
+    captureRestartNeeded,
+    liveChanged,
+    engineUpdates,
+    engineChanged,
+  };
 }
