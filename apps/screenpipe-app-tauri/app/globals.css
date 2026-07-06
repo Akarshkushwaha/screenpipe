@@ -304,12 +304,8 @@
      Must override *, :not(input):not(textarea), and ::before/::after rules above. */
   .selectable-text-layer,
   .selectable-text-layer *,
-  .selectable-text-layer *::before,
-  .selectable-text-layer *::after,
   .prose,
-  .prose *,
-  .prose *::before,
-  .prose *::after {
+  .prose * {
     -webkit-user-select: text !important;
     -moz-user-select: text !important;
     -ms-user-select: text !important;
@@ -317,11 +313,39 @@
     cursor: text !important;
     -webkit-user-drag: none !important;
   }
+  .selectable-text-layer *::before,
+  .selectable-text-layer *::after,
+  .prose *::before,
+  .prose *::after,
+  .ProseMirror *::before,
+  .ProseMirror *::after {
+    -webkit-user-select: none !important;
+    user-select: none !important;
+  }
   .selectable-text-layer::selection,
   .selectable-text-layer *::selection,
   .prose::selection,
-  .prose *::selection {
+  .prose *::selection,
+  .ProseMirror::selection,
+  .ProseMirror *::selection {
     background-color: rgba(59, 130, 246, 0.35) !important;
+  }
+  .prose br::selection,
+  .prose hr::selection,
+  .prose img::selection,
+  .prose p:empty::selection,
+  .prose .is-empty::selection,
+  .prose [data-placeholder]::selection,
+  .ProseMirror br::selection,
+  .ProseMirror hr::selection,
+  .ProseMirror img::selection,
+  .ProseMirror p:empty::selection,
+  .ProseMirror .is-empty::selection,
+  .ProseMirror [data-placeholder]::selection,
+  .selectable-text-layer br::selection,
+  .selectable-text-layer hr::selection,
+  .selectable-text-layer p:empty::selection {
+    background: transparent !important;
   }
 
   .prose a,
@@ -616,7 +640,12 @@
 .ProseMirror ul[data-type="taskList"] li > label {
   flex: 0 0 auto;
   margin-top: 0.35em;
-  user-select: none;
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+.ProseMirror ul[data-type="taskList"] li > label::selection,
+.ProseMirror ul[data-type="taskList"] li > label *::selection {
+  background: transparent !important;
 }
 .ProseMirror ul[data-type="taskList"] li > div {
   flex: 1 1 auto;
