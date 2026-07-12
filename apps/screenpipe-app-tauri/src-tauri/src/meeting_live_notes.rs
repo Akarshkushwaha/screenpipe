@@ -215,7 +215,7 @@ pub fn start(app: AppHandle) {
             let mut started_meeting_id: Option<i64> = None;
             let mut note_url: Option<String> = None;
             if let Some((port, api_key)) = local_api_config(&prewarm_app).await {
-                let url = format!("http://127.0.0.1:{port}/meetings/start");
+                let url = format!("http://127.0.0.1:{port}/meetings/prewarm");
                 let client = reqwest::Client::new();
                 let mut req = client.post(&url).json(&serde_json::json!({
                     "app": "manual",
@@ -231,13 +231,13 @@ pub fn start(app: AppHandle) {
                             match resp.json::<serde_json::Value>().await {
                                 Ok(val) => {
                                     if let Some(id) = val.get("id").and_then(|v| v.as_i64()) {
-                                        info!("meeting prewarm: auto-started meeting note id={}", id);
+                                        info!("meeting prewarm: created pre-meeting note id={}", id);
                                         started_meeting_id = Some(id);
-                                        let u = format!("http://127.0.0.1:{port}/meetings/{id}");
+                                        let u = format!("screenpipe://meeting/{id}?live=0");
                                         note_url = Some(u);
                                         let payload = serde_json::json!({
                                             "meetingId": id,
-                                            "transcript": true,
+                                            "transcript": false,
                                         });
                                         let nav = serde_json::json!({ "url": "/home?section=meetings" });
                                         // Staggered emits ensure frontend receives navigation/open events across route transitions.
@@ -262,10 +262,10 @@ pub fn start(app: AppHandle) {
                                 Err(e) => debug!("meeting prewarm: failed to parse json response: {}", e),
                             }
                         } else {
-                            debug!("meeting prewarm: meetings/start returned status {}", resp.status());
+                            debug!("meeting prewarm: meetings/prewarm returned status {}", resp.status());
                         }
                     }
-                    Err(e) => debug!("meeting prewarm: meetings/start request failed: {}", e),
+                    Err(e) => debug!("meeting prewarm: meetings/prewarm request failed: {}", e),
                 }
             }
 
@@ -277,6 +277,7 @@ pub fn start(app: AppHandle) {
                     "label": "join and take notes",
                     "type": "meeting_join",
                     "url": url,
+                    "deeplinkUrl": note_url,
                     "primary": true,
                 }));
             }

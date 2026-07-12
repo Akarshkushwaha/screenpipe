@@ -255,6 +255,73 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Find a recent prewarm meeting note created within the last 30 minutes
+    /// so it can be transitioned into an active meeting when join/detection occurs.
+    pub async fn find_recent_prewarm_meeting(
+        &self,
+        title_hint: Option<&str>,
+    ) -> Result<Option<i64>, SqlxError> {
+        let now = chrono::Utc::now();
+        let window_start = (now - chrono::Duration::minutes(30))
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+
+        if let Some(hint) = title_hint.filter(|t| !t.trim().is_empty()) {
+            let id: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM meetings
+                 WHERE detection_source = 'prewarm'
+                   AND meeting_end IS NOT NULL
+                   AND meeting_start >= ?1
+                   AND LOWER(title) = LOWER(?2)
+                 ORDER BY id DESC LIMIT 1",
+            )
+            .bind(&window_start)
+            .bind(hint)
+            .fetch_optional(&self.pool)
+            .await?;
+            if id.is_some() {
+                return Ok(id);
+            }
+        }
+
+        let id: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM meetings
+             WHERE detection_source = 'prewarm'
+               AND meeting_end IS NOT NULL
+               AND meeting_start >= ?1
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(&window_start)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Adopt a prewarm meeting note into an active meeting when join/detection occurs.
+    pub async fn adopt_prewarm_meeting(
+        &self,
+        id: i64,
+        meeting_app: &str,
+        detection_source: &str,
+        title: Option<&str>,
+        attendees: Option<&str>,
+    ) -> Result<(), SqlxError> {
+        self.reopen_meeting(id).await?;
+        let mut tx = self.begin_immediate_with_retry().await?;
+        sqlx::query(
+            "UPDATE meetings SET meeting_app = ?1, detection_source = ?2, title = COALESCE(?3, title), attendees = COALESCE(?4, attendees) WHERE id = ?5",
+        )
+        .bind(meeting_app)
+        .bind(detection_source)
+        .bind(title)
+        .bind(attendees)
+        .bind(id)
+        .execute(&mut **tx.conn())
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn close_orphaned_meetings(&self) -> Result<u64, SqlxError> {
         let mut tx = self.begin_immediate_with_retry().await?;
         let now = chrono::Utc::now()

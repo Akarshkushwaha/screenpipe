@@ -96,6 +96,36 @@ pub(crate) async fn insert_new_audio_process_meeting(
     title: Option<&str>,
     attendees: Option<&str>,
 ) -> AutoStartOutcome {
+    if let Ok(Some(prewarm_id)) = db.find_recent_prewarm_meeting(title).await {
+        if let Ok(()) = db
+            .adopt_prewarm_meeting(prewarm_id, platform, "audio_process", title, attendees)
+            .await
+        {
+            info!(
+                "audio-process meeting detector: adopted prewarm meeting note (id={}, app={})",
+                prewarm_id, platform
+            );
+            if let Err(e) = screenpipe_events::send_event(
+                "meeting_started",
+                serde_json::json!({
+                    "meeting_id": prewarm_id,
+                    "app": platform,
+                    "title": title,
+                    "detection_source": "audio_process",
+                }),
+            ) {
+                warn!(
+                    "audio-process meeting detector: failed to emit meeting_started event: {}",
+                    e
+                );
+            }
+            if let Ok(meeting) = db.get_meeting_by_id(prewarm_id).await {
+                capture_detection_decision(&meeting, "audio_process_start", None);
+            }
+            return AutoStartOutcome::Started(prewarm_id);
+        }
+    }
+
     match db
         .insert_meeting(platform, "audio_process", title, attendees)
         .await

@@ -64,6 +64,13 @@ pub struct StartMeetingRequest {
 }
 
 #[derive(OaSchema, Deserialize, Debug)]
+pub struct PrewarmMeetingRequest {
+    pub app: Option<String>,
+    pub title: Option<String>,
+    pub attendees: Option<String>,
+}
+
+#[derive(OaSchema, Deserialize, Debug)]
 pub struct StopMeetingRequest {
     pub id: Option<i64>,
     /// When false, skip auto-appending the user's typed text (and edited
@@ -642,6 +649,33 @@ pub(crate) async fn start_meeting_handler(
             );
             active_id
         }
+    } else if let Ok(Some(prewarm_id)) = state
+        .db
+        .find_recent_prewarm_meeting(body.title.as_deref())
+        .await
+    {
+        state
+            .db
+            .adopt_prewarm_meeting(
+                prewarm_id,
+                app,
+                "manual",
+                body.title.as_deref(),
+                body.attendees.as_deref(),
+            )
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonResponse(json!({"error": e.to_string()})),
+                )
+            })?;
+        tracing::info!(
+            "start_meeting: adopting prewarm meeting note (id={}, app={})",
+            prewarm_id,
+            app
+        );
+        prewarm_id
     } else {
         state
             .db
@@ -727,6 +761,44 @@ pub(crate) async fn start_meeting_handler(
     ) {
         tracing::warn!("failed to emit meeting_started event: {}", e);
     }
+
+    Ok(JsonResponse(meeting))
+}
+
+#[oasgen]
+pub(crate) async fn prewarm_meeting_handler(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<PrewarmMeetingRequest>,
+) -> Result<JsonResponse<MeetingRecord>, (StatusCode, JsonResponse<Value>)> {
+    let app = body.app.as_deref().unwrap_or("manual");
+
+    let id = state
+        .db
+        .insert_meeting(
+            app,
+            "prewarm",
+            body.title.as_deref(),
+            body.attendees.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({"error": e.to_string()})),
+            )
+        })?;
+
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    let _ = state.db.end_meeting(id, &now, Some("prewarm")).await;
+
+    let meeting = state.db.get_meeting_by_id(id).await.map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            JsonResponse(json!({"error": format!("meeting not found: {}", e)})),
+        )
+    })?;
 
     Ok(JsonResponse(meeting))
 }

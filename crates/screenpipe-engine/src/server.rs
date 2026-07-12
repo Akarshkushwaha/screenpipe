@@ -46,8 +46,9 @@ use crate::{
         meetings::{
             bulk_delete_meetings_handler, delete_meeting_handler, export_handler,
             get_meeting_handler, get_meeting_transcript_handler, list_meetings_handler,
-            meeting_status_handler, merge_meetings_handler, split_meeting_handler,
-            start_meeting_handler, stop_meeting_handler, update_meeting_handler,
+            meeting_status_handler, merge_meetings_handler, prewarm_meeting_handler,
+            split_meeting_handler, start_meeting_handler, stop_meeting_handler,
+            update_meeting_handler,
         },
         memories::{
             create_memory_handler, delete_memory_handler, get_memory_handler,
@@ -754,6 +755,7 @@ impl SCServer {
             // HTTP twin of the `screenpipe export` CLI; used by the MCP export-video tool.
             .post("/export", export_handler)
             .post("/meetings/bulk-delete", bulk_delete_meetings_handler)
+            .post("/meetings/prewarm", prewarm_meeting_handler)
             .post("/meetings/start", start_meeting_handler)
             .post("/meetings/stop", stop_meeting_handler)
             .get("/meetings/:id/transcript", get_meeting_transcript_handler)

@@ -100,6 +100,30 @@ pub(crate) async fn insert_new_meeting(
     title: Option<&str>,
     attendees: Option<&str>,
 ) -> i64 {
+    if let Ok(Some(prewarm_id)) = db.find_recent_prewarm_meeting(title).await {
+        if let Ok(()) = db
+            .adopt_prewarm_meeting(prewarm_id, app, "ui_scan", title, attendees)
+            .await
+        {
+            info!(
+                "meeting v2: adopted prewarm meeting note (id={}, app={}, title={:?})",
+                prewarm_id, app, title
+            );
+            if let Err(e) = screenpipe_events::send_event(
+                "meeting_started",
+                serde_json::json!({
+                    "meeting_id": prewarm_id,
+                    "app": app,
+                    "title": title,
+                    "detection_source": "ui_scan",
+                }),
+            ) {
+                warn!("meeting v2: failed to emit meeting_started event: {}", e);
+            }
+            return prewarm_id;
+        }
+    }
+
     match db.insert_meeting(app, "ui_scan", title, attendees).await {
         Ok(id) => {
             info!(
