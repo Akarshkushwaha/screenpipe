@@ -706,7 +706,6 @@ fn is_process_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        use std::ptr;
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
         unsafe {
             let handle = windows_sys::Win32::System::Threading::OpenProcess(
@@ -714,7 +713,7 @@ fn is_process_alive(pid: u32) -> bool {
                 0, // FALSE
                 pid,
             );
-            if handle.is_null() || handle == ptr::null_mut() {
+            if handle.is_null() {
                 false
             } else {
                 windows_sys::Win32::Foundation::CloseHandle(handle);
@@ -1793,7 +1792,7 @@ async fn setup_pipe_permissions(
     if perms.has_any_restrictions() || force_write {
         // Generate a unique pipe token for server-side enforcement
         use rand::Rng;
-        let suffix: u64 = rand::thread_rng().gen();
+        let suffix: u64 = rand::rng().random();
         let t = format!("sp_pipe_{:016x}", suffix);
         perms.pipe_token = Some(t.clone());
 
@@ -2313,7 +2312,7 @@ impl PipeManager {
                         if path
                             .file_name()
                             .and_then(|n| n.to_str())
-                            .map_or(false, |n| n.starts_with('.'))
+                            .is_some_and(|n| n.starts_with('.'))
                         {
                             continue;
                         }
@@ -2321,7 +2320,7 @@ impl PipeManager {
                         if !path
                             .extension()
                             .and_then(|e| e.to_str())
-                            .map_or(false, is_user_facing_artifact_ext)
+                            .is_some_and(is_user_facing_artifact_ext)
                         {
                             continue;
                         }
@@ -6016,7 +6015,7 @@ fn should_run_config(cfg: &ScheduleConfig, last_run: DateTime<Utc>) -> bool {
     }
     match next_fire(cfg, search_from) {
         // Don't fire a slot past the effective end (e.g. beyond the Nth run).
-        Some(next) => now >= next && end.map_or(true, |e| next <= e),
+        Some(next) => now >= next && end.is_none_or(|e| next <= e),
         None => false,
     }
 }
