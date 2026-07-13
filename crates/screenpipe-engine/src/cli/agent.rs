@@ -47,7 +47,9 @@ pub async fn handle_agent_command(cmd: &AgentCommand) -> Result<()> {
 /// Programmatic entry point for setting up skills and MCP servers in AI apps.
 /// Supports individual targets or "all".
 pub fn setup_agent(target: &str, api_url: &str) -> Result<Vec<String>, String> {
-    let all_targets = ["claude", "cursor", "codex", "openclaw", "hermes", "windsurf"];
+    let all_targets = [
+        "claude", "cursor", "codex", "openclaw", "hermes", "windsurf",
+    ];
     let mut installed = Vec::new();
 
     if target == "all" {
@@ -169,10 +171,12 @@ fn write_skill(skills_dir: &Path, name: &str, md: &str, api_url: &str) -> Result
     // Host-aware: the bundled skills say `localhost:3030`; rewrite to the
     // target host so an off-box agent hits the right screenpipe.
     let body = md.replace("localhost:3030", host_port(api_url));
-    std::fs::create_dir_all(skills_dir).with_context(|| format!("create {}", skills_dir.display()))?;
+    std::fs::create_dir_all(skills_dir)
+        .with_context(|| format!("create {}", skills_dir.display()))?;
     if skills_dir.ends_with("rules") {
         let mdc_path = skills_dir.join(format!("{}.mdc", name));
-        std::fs::write(&mdc_path, &body).with_context(|| format!("write {}", mdc_path.display()))?;
+        std::fs::write(&mdc_path, &body)
+            .with_context(|| format!("write {}", mdc_path.display()))?;
         return Ok(mdc_path);
     }
     let dir = skills_dir.join(name);
@@ -401,7 +405,13 @@ mod tests {
         let rules_dir = dir.join(".cursor/rules");
         let _ = std::fs::remove_dir_all(&dir);
 
-        let p = write_skill(&rules_dir, "screenpipe", "# test skill\nuse http://localhost:3030", "http://localhost:3030").unwrap();
+        let p = write_skill(
+            &rules_dir,
+            "screenpipe",
+            "# test skill\nuse http://localhost:3030",
+            "http://localhost:3030",
+        )
+        .unwrap();
         assert_eq!(p, rules_dir.join("screenpipe.mdc"));
         assert!(p.exists());
         let content = std::fs::read_to_string(&p).unwrap();
