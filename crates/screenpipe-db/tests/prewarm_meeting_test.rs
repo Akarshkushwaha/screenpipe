@@ -67,4 +67,50 @@ mod tests {
         assert!(meeting.meeting_end.is_none());
         assert_eq!(meeting.title.as_deref(), Some("Weekly Sync"));
     }
+
+    #[tokio::test]
+    async fn test_prewarm_meeting_multiple_recent() {
+        let db = setup_db().await;
+
+        let now = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+
+        let id1 = db
+            .insert_meeting("manual", "prewarm", Some("Daily Standup"), None)
+            .await
+            .unwrap();
+        db.end_meeting(id1, &now, Some("prewarm")).await.unwrap();
+
+        let id2 = db
+            .insert_meeting("manual", "prewarm", Some("Design Review"), None)
+            .await
+            .unwrap();
+        db.end_meeting(id2, &now, Some("prewarm")).await.unwrap();
+
+        // When multiple prewarm meetings exist and no title hint is provided,
+        // it must return None to avoid adopting the wrong meeting.
+        let ambiguous = db.find_recent_prewarm_meeting(None).await.unwrap();
+        assert_eq!(ambiguous, None);
+
+        // When a specific title hint is provided, it must match the exact meeting.
+        let match1 = db
+            .find_recent_prewarm_meeting(Some("Daily Standup"))
+            .await
+            .unwrap();
+        assert_eq!(match1, Some(id1));
+
+        let match2 = db
+            .find_recent_prewarm_meeting(Some("Design Review"))
+            .await
+            .unwrap();
+        assert_eq!(match2, Some(id2));
+
+        // When an unrelated title hint is provided, it must return None.
+        let match_none = db
+            .find_recent_prewarm_meeting(Some("Unrelated Sync"))
+            .await
+            .unwrap();
+        assert_eq!(match_none, None);
+    }
 }

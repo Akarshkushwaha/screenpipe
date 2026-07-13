@@ -279,22 +279,34 @@ impl DatabaseManager {
             .bind(hint)
             .fetch_optional(&self.pool)
             .await?;
-            if id.is_some() {
-                return Ok(id);
-            }
+            return Ok(id);
         }
 
-        let id: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM meetings
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM meetings
              WHERE detection_source = 'prewarm'
                AND meeting_end IS NOT NULL
-               AND meeting_start >= ?1
-             ORDER BY id DESC LIMIT 1",
+               AND meeting_start >= ?1",
         )
         .bind(&window_start)
-        .fetch_optional(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(id)
+
+        if count == 1 {
+            let id: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM meetings
+                 WHERE detection_source = 'prewarm'
+                   AND meeting_end IS NOT NULL
+                   AND meeting_start >= ?1
+                 LIMIT 1",
+            )
+            .bind(&window_start)
+            .fetch_optional(&self.pool)
+            .await?;
+            Ok(id)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Adopt a prewarm meeting note into an active meeting when join/detection occurs.
