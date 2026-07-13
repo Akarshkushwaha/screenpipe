@@ -51,6 +51,14 @@ pub struct ImportedSkill {
     pub path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct DetectedAiApp {
+    pub id: String,
+    pub name: String,
+    pub detected: bool,
+    pub config_path: String,
+}
+
 /// A skill offered by the curated registry. Installing one downloads its folder
 /// (the directory containing `SKILL.md`) from a public GitHub repo into the
 /// store, reusing the same store the device/folder importers write to.
@@ -673,6 +681,43 @@ pub async fn install_registry_skill(
     })
 }
 
+#[tauri::command]
+#[specta::specta]
+pub fn scan_ai_apps() -> Result<Vec<DetectedAiApp>, String> {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return Ok(vec![]),
+    };
+
+    let apps = vec![
+        ("claude", "Claude Desktop / Code", home.join(".claude")),
+        ("cursor", "Cursor", home.join(".cursor")),
+        ("codex", "Codex", home.join(".codex")),
+        ("openclaw", "OpenClaw", home.join("openclaw")),
+        ("hermes", "Hermes", home.join(".hermes")),
+        ("windsurf", "Windsurf", home.join(".codeium/windsurf")),
+    ];
+
+    let mut result = Vec::new();
+    for (id, name, path) in apps {
+        let detected = path.exists();
+        result.push(DetectedAiApp {
+            id: id.to_string(),
+            name: name.to_string(),
+            detected,
+            config_path: path.to_string_lossy().to_string(),
+        });
+    }
+
+    Ok(result)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn setup_ai_app(target: String) -> Result<Vec<String>, String> {
+    screenpipe_engine::cli::agent::setup_agent(&target, "http://localhost:3030")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,5 +839,18 @@ mod tests {
         assert!(safe_join(base, "../evil").is_err());
         assert!(safe_join(base, "/etc/passwd").is_err());
         assert!(safe_join(base, "a/../../b").is_err());
+    }
+
+    #[test]
+    fn test_scan_ai_apps() {
+        let apps = scan_ai_apps().expect("should scan ai apps without error");
+        assert_eq!(apps.len(), 6);
+        let ids: Vec<&str> = apps.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&"claude"));
+        assert!(ids.contains(&"cursor"));
+        assert!(ids.contains(&"codex"));
+        assert!(ids.contains(&"openclaw"));
+        assert!(ids.contains(&"hermes"));
+        assert!(ids.contains(&"windsurf"));
     }
 }

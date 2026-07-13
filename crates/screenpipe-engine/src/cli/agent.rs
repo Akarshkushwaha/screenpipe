@@ -44,6 +44,37 @@ pub async fn handle_agent_command(cmd: &AgentCommand) -> Result<()> {
     }
 }
 
+/// Programmatic entry point for setting up skills and MCP servers in AI apps.
+/// Supports individual targets or "all".
+pub fn setup_agent(target: &str, api_url: &str) -> Result<Vec<String>, String> {
+    let all_targets = ["claude", "cursor", "codex", "openclaw", "hermes", "windsurf"];
+    let mut installed = Vec::new();
+
+    if target == "all" {
+        for t in all_targets {
+            if let Ok(res) = setup_agent(t, api_url) {
+                installed.extend(res);
+            }
+        }
+        return Ok(installed);
+    }
+
+    if target == "claude" {
+        let _ = setup("claude-code", api_url);
+        let _ = setup("claude-desktop", api_url);
+        installed.push("claude".to_string());
+        return Ok(installed);
+    }
+
+    match setup(target, api_url) {
+        Ok(()) => {
+            installed.push(target.to_string());
+            Ok(installed)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Where a given agent keeps its skills + MCP config. Paths mirror the in-app
 /// OpenClaw/Hermes cards exactly so CLI and GUI setups agree.
 struct AgentLayout {
@@ -138,6 +169,12 @@ fn write_skill(skills_dir: &Path, name: &str, md: &str, api_url: &str) -> Result
     // Host-aware: the bundled skills say `localhost:3030`; rewrite to the
     // target host so an off-box agent hits the right screenpipe.
     let body = md.replace("localhost:3030", host_port(api_url));
+    std::fs::create_dir_all(skills_dir).with_context(|| format!("create {}", skills_dir.display()))?;
+    if skills_dir.ends_with("rules") {
+        let mdc_path = skills_dir.join(format!("{}.mdc", name));
+        std::fs::write(&mdc_path, &body).with_context(|| format!("write {}", mdc_path.display()))?;
+        return Ok(mdc_path);
+    }
     let dir = skills_dir.join(name);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join("SKILL.md");
@@ -355,6 +392,20 @@ mod tests {
         merge_mcp_toml(&path, true, "http://box:3030").unwrap();
         let s2 = std::fs::read_to_string(&path).unwrap();
         assert_eq!(s2.matches("[mcp_servers.screenpipe]").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_skill_mdc_rules() {
+        let dir = std::env::temp_dir().join(format!("sp-agent-rules-{}", std::process::id()));
+        let rules_dir = dir.join(".cursor/rules");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let p = write_skill(&rules_dir, "screenpipe", "# test skill\nuse http://localhost:3030", "http://localhost:3030").unwrap();
+        assert_eq!(p, rules_dir.join("screenpipe.mdc"));
+        assert!(p.exists());
+        let content = std::fs::read_to_string(&p).unwrap();
+        assert!(content.contains("# test skill"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

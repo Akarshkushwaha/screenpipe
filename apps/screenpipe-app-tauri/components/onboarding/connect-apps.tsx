@@ -20,6 +20,7 @@ import { readTextFile, writeFile, mkdir } from "@tauri-apps/plugin-fs";
 import { homeDir, join, dirname } from "@tauri-apps/api/path";
 import { platform } from "@tauri-apps/plugin-os";
 import posthog from "posthog-js";
+import { invoke } from "@tauri-apps/api/core";
 
 // ─── Icons ───────────────────────────────────────────────────────────────────
 
@@ -516,9 +517,33 @@ export default function ConnectApps({ handleNextSlide }: ConnectAppsProps) {
   const [seconds, setSeconds] = useState(0);
   const mountTimeRef = useRef(Date.now());
 
+  const [detectedAiApps, setDetectedAiApps] = useState<
+    Array<{
+      id: string;
+      name: string;
+      detected: boolean;
+      config_path: string;
+    }>
+  >([]);
+  const [setupAllAiState, setSetupAllAiState] = useState<"idle" | "installing" | "installed" | "error">("idle");
+
   // Check existing connections on mount
   useEffect(() => {
     const check = async () => {
+      try {
+        const apps = await invoke<
+          Array<{
+            id: string;
+            name: string;
+            detected: boolean;
+            config_path: string;
+          }>
+        >("scan_ai_apps");
+        setDetectedAiApps(apps);
+      } catch (e) {
+        console.error("failed to scan ai apps:", e);
+      }
+
       const stateUpdates: Record<string, CardState> = {};
       const nameUpdates: Record<string, string> = {};
 
@@ -573,6 +598,17 @@ export default function ConnectApps({ handleNextSlide }: ConnectAppsProps) {
     };
     check();
   }, []);
+
+  const handleSetupAllAi = async () => {
+    setSetupAllAiState("installing");
+    try {
+      await invoke("setup_ai_app", { target: "all" });
+      setSetupAllAiState("installed");
+    } catch (e) {
+      console.error("failed to setup ai apps:", e);
+      setSetupAllAiState("error");
+    }
+  };
 
   // Poll for pro status while screen is open — catches payment completed via
   // any checkout (account section, external browser, etc.), not just the one
@@ -803,6 +839,52 @@ export default function ConnectApps({ handleNextSlide }: ConnectAppsProps) {
             ? "everything is unlocked — connect what you use"
             : "screenpipe sees your screen — connect the tools it acts on"}
         </p>
+      </motion.div>
+
+      <motion.div
+        className="w-full mb-3 p-3 rounded-lg border border-border/40 bg-card/40 flex flex-col gap-2"
+        initial={{ opacity: 0, y: 6 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.18 }}
+      >
+        <div className="flex items-center justify-between">
+          <div className="flex flex-col">
+            <span className="font-mono text-xs font-semibold lowercase">
+              ⚡ add screenpipe skill to any ai
+            </span>
+            <span className="font-mono text-[10px] text-muted-foreground/60">
+              claude, cursor, codex, openclaw, hermes, windsurf
+            </span>
+          </div>
+          <button
+            onClick={handleSetupAllAi}
+            disabled={setupAllAiState === "installing" || setupAllAiState === "installed"}
+            className="font-mono text-[11px] px-3 py-1 rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-all"
+          >
+            {setupAllAiState === "installing"
+              ? "installing..."
+              : setupAllAiState === "installed"
+              ? "installed ✓"
+              : "install all"}
+          </button>
+        </div>
+
+        {detectedAiApps.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 pt-1 border-t border-border/20">
+            {detectedAiApps.map((app) => (
+              <span
+                key={app.id}
+                className={`font-mono text-[9px] px-1.5 py-0.5 rounded border ${
+                  app.detected
+                    ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                    : "border-border/30 bg-muted/20 text-muted-foreground/40"
+                }`}
+              >
+                {app.name} {app.detected && "• detected"}
+              </span>
+            ))}
+          </div>
+        )}
       </motion.div>
 
       <div className="grid grid-cols-3 gap-2 w-full auto-rows-fr">
