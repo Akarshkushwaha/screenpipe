@@ -1301,12 +1301,39 @@ async fn submit_device_logs(
 
 /// Auto-submit on the stalled-upload watchdog (device enrolled but not landing
 /// data). Thin wrapper over [`submit_device_logs`] with the stall reason.
-async fn submit_stall_logs(cfg: &EnterpriseSyncConfig, http: &reqwest::Client) {
-    let feedback = format!(
-        "auto: enterprise device recording but not landing data in org storage (device {}, mode {})",
+fn stall_log_feedback(cfg: &EnterpriseSyncConfig, last_error: Option<&str>) -> String {
+    format!(
+        "auto: enterprise device recording but not landing data in org storage (device {}, mode {}); last sync error: {}",
         cfg.device_id,
-        cfg.upload_mode.label()
-    );
+        cfg.upload_mode.label(),
+        last_error.unwrap_or("unknown")
+    )
+}
+
+fn sync_failure_feedback_summary(error: &EnterpriseSyncError) -> String {
+    match error {
+        EnterpriseSyncError::LocalApi(_) => "local API request failed".to_string(),
+        EnterpriseSyncError::Ingest(_) => "ingest request failed".to_string(),
+        EnterpriseSyncError::IngestAuthRejected => {
+            "ingest auth rejected (license invalid / revoked)".to_string()
+        }
+        EnterpriseSyncError::CentralizedDataDisabled => {
+            "centralized data not enabled for this org".to_string()
+        }
+        EnterpriseSyncError::IngestServerError(status) => {
+            format!("ingest server error: status {status}")
+        }
+        EnterpriseSyncError::Network(_) => "control-plane network error".to_string(),
+        EnterpriseSyncError::Io(_) => "local I/O error".to_string(),
+    }
+}
+
+async fn submit_stall_logs(
+    cfg: &EnterpriseSyncConfig,
+    http: &reqwest::Client,
+    last_error: Option<&str>,
+) {
+    let feedback = stall_log_feedback(cfg, last_error);
     if submit_device_logs(cfg, http, &feedback).await.is_some() {
         info!("enterprise sync: auto-submitted diagnostic logs (device enrolled but not uploading)");
     }
@@ -1489,6 +1516,37 @@ pub async fn run(
             Ok(_) => {}
             Err(_) => saw_failure_since_data = true,
         }
+
+        // Emit the failure before the watchdog snapshots the log files. The
+        // old ordering collected diagnostics first and only logged `tick
+        // failed` afterward, so first-failure bundles (especially on macOS)
+        // omitted the one line support needed. The feedback also carries the
+        // summary in case the tracing appender has not flushed to disk yet.
+        let failure_summary = match &result {
+            Err(error @ EnterpriseSyncError::IngestAuthRejected) => {
+                error!(
+                    "enterprise sync: license rejected by ingest endpoint (license invalid / revoked), sleeping {}s",
+                    RETRY_AFTER_AUTH_FAIL.as_secs()
+                );
+                Some(sync_failure_feedback_summary(error))
+            }
+            Err(error @ EnterpriseSyncError::CentralizedDataDisabled) => {
+                error!(
+                    "enterprise sync: centralized data is NOT enabled for this org — an admin must enable it in the dashboard before devices can upload; pausing {}s",
+                    RETRY_AFTER_AUTH_FAIL.as_secs()
+                );
+                Some(sync_failure_feedback_summary(error))
+            }
+            Err(error) => {
+                warn!(
+                    "enterprise sync: tick failed ({}); backing off {}s",
+                    error,
+                    backoff.as_secs()
+                );
+                Some(sync_failure_feedback_summary(error))
+            }
+            Ok(_) => None,
+        };
         // Wall-clock elapsed since the persisted last submit. A clock that moved
         // backwards (Err) is treated as "just submitted" (Duration::ZERO) so we
         // never spam on a clock glitch.
@@ -1503,7 +1561,7 @@ pub async fn run(
             saw_failure_since_data,
             since_last_submit,
         ) {
-            submit_stall_logs(&cfg, &http).await;
+            submit_stall_logs(&cfg, &http, failure_summary.as_deref()).await;
             // Persist BEFORE updating memory so a restart right after still honors
             // the cooldown. Set regardless of submit success → a fully-offline
             // device retries next window rather than hammering every tick.
@@ -1544,34 +1602,18 @@ pub async fn run(
                 }
             }
             Err(EnterpriseSyncError::IngestAuthRejected) => {
-                error!(
-                    "enterprise sync: license rejected by ingest endpoint (license invalid / revoked), sleeping {}s",
-                    RETRY_AFTER_AUTH_FAIL.as_secs()
-                );
                 if sleep_or_shutdown(RETRY_AFTER_AUTH_FAIL, &mut shutdown).await {
                     break;
                 }
                 continue;
             }
             Err(EnterpriseSyncError::CentralizedDataDisabled) => {
-                // The device is recording but the org hasn't turned on
-                // centralized data, so nothing can upload. Say exactly that —
-                // the fix is an admin toggle in the dashboard, not a license issue.
-                error!(
-                    "enterprise sync: centralized data is NOT enabled for this org — an admin must enable it in the dashboard before devices can upload; pausing {}s",
-                    RETRY_AFTER_AUTH_FAIL.as_secs()
-                );
                 if sleep_or_shutdown(RETRY_AFTER_AUTH_FAIL, &mut shutdown).await {
                     break;
                 }
                 continue;
             }
-            Err(e) => {
-                warn!(
-                    "enterprise sync: tick failed ({}); backing off {}s",
-                    e,
-                    backoff.as_secs()
-                );
+            Err(_) => {
                 if sleep_or_shutdown(backoff, &mut shutdown).await {
                     break;
                 }
@@ -1631,6 +1673,21 @@ mod tests {
             true,
             None
         ));
+    }
+
+    #[test]
+    fn watchdog_feedback_carries_the_failure_that_triggered_collection() {
+        let dir = TempDir::new().unwrap();
+        let cfg = test_cfg(&dir, "http://localhost/ingest".into());
+        let summary = sync_failure_feedback_summary(&EnterpriseSyncError::LocalApi(
+            "OCR backlog request timed out".to_string(),
+        ));
+        let feedback = stall_log_feedback(&cfg, Some(&summary));
+
+        assert!(feedback.contains("device dev-1"));
+        assert!(feedback.contains("mode hosted_ingest"));
+        assert!(feedback.contains("last sync error: local API request failed"));
+        assert!(!feedback.contains("OCR backlog request timed out"));
     }
 
     #[test]

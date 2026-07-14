@@ -39,6 +39,10 @@ vi.mock("./use-settings", () => ({
   getStore: vi.fn(),
 }));
 
+if (!vi.mocked) {
+  vi.mocked = <T>(fn: T): any => fn;
+}
+
 describe("scheduleManagedRestart bounded timeout regression", () => {
   beforeEach(() => {
     vi.clearAllMocks();

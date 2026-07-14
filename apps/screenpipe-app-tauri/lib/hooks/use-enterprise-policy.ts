@@ -276,45 +276,6 @@ async function applyAppUpdatePolicy(policy: EnterpriseAppUpdatePolicy): Promise<
 }
 
 /**
- * Apply enterprise-forced PII redaction settings to the local settings store so
- * the recording engine honors them. The admin sets these in the workspace
- * policy (lockedSettings.usePiiRemoval / piiBackend / piiRedactionLabels); we
- * write them into `settings` the same way the AI-preset + app-update policies
- * do, so the on-device ONNX + Tinfoil PII workers pick them up. The matching UI
- * controls are disabled separately so the employee can't override a forced
- * value. Keys map 1:1 to the engine's RecordingSettings fields
- * (use_pii_removal, pii_backend, pii_redaction_labels).
- */
-async function applyPiiPolicy(lockedSettings: Record<string, unknown>): Promise<void> {
-  const updates: Record<string, unknown> = {};
-
-  const master = lockedSettings.usePiiRemoval;
-  if (master === "true" || master === "false") {
-    updates.usePiiRemoval = master === "true";
-  }
-
-  const backend = lockedSettings.piiBackend;
-  if (backend === "local" || backend === "tinfoil") {
-    updates.piiBackend = backend;
-  }
-
-  const labels = lockedSettings.piiRedactionLabels;
-  if (Array.isArray(labels)) {
-    // canonical SpanLabel snake_case names; `secret` is always redacted
-    const clean = Array.from(new Set(labels.filter((l): l is string => typeof l === "string")));
-    if (!clean.includes("secret")) clean.push("secret");
-    updates.piiRedactionLabels = clean;
-  }
-
-  if (Object.keys(updates).length === 0) return;
-
-  const store = await getStore();
-  const settings = (await store.get<Record<string, unknown>>("settings")) || {};
-  await store.set("settings", { ...settings, ...updates });
-  await store.save();
-}
-
-/**
  * Serialized and debounced restart queue for enterprise managed settings.
  * Ensures overlapping or rapid policy polls do not stack stop/start cycles.
  */
@@ -501,12 +462,15 @@ export async function applyManagedDeviceSettings(
     serverRestartUpdates,
     captureRestartUpdates,
     liveUpdates,
+    managedValues,
     serverRestartNeeded,
     captureRestartNeeded,
     liveChanged,
   } = computeManagedSettingUpdates(lockedSettings, settings);
+  const managedValuesChanged =
+    JSON.stringify(settings.enterpriseManagedSettings || {}) !== JSON.stringify(managedValues);
 
-  if (!serverRestartNeeded && !captureRestartNeeded && !liveChanged) {
+  if (!serverRestartNeeded && !captureRestartNeeded && !liveChanged && !managedValuesChanged) {
     if (pendingManagedRestartType) {
       scheduleManagedRestart(
         pendingManagedRestartType,
@@ -525,7 +489,11 @@ export async function applyManagedDeviceSettings(
       ? "capture"
       : null;
   try {
-    await store.set("settings", { ...settings, ...allUpdates });
+    await store.set("settings", {
+      ...settings,
+      ...allUpdates,
+      enterpriseManagedSettings: managedValues,
+    });
     await store.save();
   } catch (error) {
     // Store plugins can update their in-memory value before a disk save fails.
@@ -820,7 +788,7 @@ export function useEnterprisePolicy() {
         console.warn("[enterprise] failed to apply app update policy:", e);
       }
 
-      // Apply enterprise-forced managed settings (audio, vision, PII, input capture, LAN,
+      // Apply every validated managed device setting in one pass (audio, vision, PII, input capture, LAN,
       // transcription engine, analytics). Restarts server or capture when forced values change.
       try {
         await applyManagedDeviceSettings(result.lockedSettings);
