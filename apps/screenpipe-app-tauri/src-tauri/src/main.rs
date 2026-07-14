@@ -660,7 +660,7 @@ async fn main() {
     // inside `.setup()`: a `block_on` there nests runtimes under
     // #[tokio::main] and panics ("Cannot start a runtime from within a
     // runtime"), killing the app at launch.
-    let _ = crate::auth_token::migrate_plaintext_token(
+    let initial_cloud_token = crate::auth_token::migrate_plaintext_token(
         &screenpipe_core::paths::default_screenpipe_data_dir(),
     )
     .await;
@@ -674,7 +674,7 @@ async fn main() {
         last_spawn_epoch: Arc::new(AtomicU64::new(0)),
         wants_recording: Arc::new(AtomicBool::new(false)),
         interrupted_meeting: Arc::new(tokio::sync::Mutex::new(None)),
-        cloud_token: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        cloud_token: Arc::new(arc_swap::ArcSwap::new(Arc::new(initial_cloud_token))),
         db_wedge_breaker: recording::new_db_wedge_breaker(),
     };
     let pi_state = pi::PiState(Arc::new(tokio::sync::Mutex::new(pi::PiPool::new())));
@@ -881,9 +881,22 @@ async fn main() {
                     .item(&PredefinedMenuItem::select_all(app, None)?)
                     .build()?;
 
+                // Standard Window menu so macOS key equivalents (Cmd-W close,
+                // Cmd-M minimize) work — without a menu item carrying the
+                // accelerator, AppKit silently swallows the keystroke. Close
+                // goes through the CloseRequested handler above, so Cmd-W
+                // hides to tray exactly like the red traffic-light button.
+                let window_submenu = SubmenuBuilder::new(app, "Window")
+                    .item(&PredefinedMenuItem::minimize(app, None)?)
+                    .item(&PredefinedMenuItem::maximize(app, None)?)
+                    .separator()
+                    .item(&PredefinedMenuItem::close_window(app, None)?)
+                    .build()?;
+
                 let menu = MenuBuilder::new(app)
                     .item(&app_submenu)
                     .item(&edit_submenu)
+                    .item(&window_submenu)
                     .build()?;
 
                 app.set_menu(menu)?;
@@ -1771,6 +1784,12 @@ async fn main() {
             crate::meeting_live_notes::start(app_handle.clone());
             crate::meeting_stall_notifications::start(app_handle.clone());
             crate::db_recovery_notifications::start(app_handle.clone());
+
+            // Background ChatGPT OAuth token refresh — keeps access tokens
+            // fresh so the lazy path in get_valid_token() rarely needs to
+            // refresh at request time. Separate from OAuthRefreshScheduler
+            // which only handles screenpipe-connect integrations.
+            crate::chatgpt_oauth::start_background_refresh();
 
             #[cfg(target_os = "macos")]
             crate::window::reset_to_regular_and_refresh_tray(&app_handle);

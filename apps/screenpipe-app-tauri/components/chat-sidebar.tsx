@@ -30,7 +30,7 @@
  * survives app restart. Delete removes the file.
  */
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useInterval } from "@/lib/hooks/use-interval";
 import { useTauriEvent } from "@/lib/hooks/use-tauri-event";
 import {
@@ -61,6 +61,7 @@ import {
 import {
   conversationMetaFromJson,
   deleteConversationFile,
+  listConversations,
   loadConversationFile,
   updateConversationFlags,
 } from "@/lib/chat-storage";
@@ -103,6 +104,7 @@ import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/use-toast";
 import { normalizeQueueEventPayload } from "@/lib/chat-queue-controls";
 import { Skeleton } from "@/components/ui/skeleton";
+import { localFetch } from "@/lib/api";
 import {
   applySidebarRecentsCap,
   buildSidebarRecentsSections,
@@ -114,10 +116,15 @@ import {
   validateSidebarGroupName,
 } from "@/lib/utils/chat-sidebar-grouping";
 
-/** Max top-level rows shown across recents + pipes. */
+/** Max top-level rows shown in recents. Pipes use the authoritative inventory. */
 const SIDEBAR_CAP = 15;
-/** Minimum slots reserved for pipes when pipe sessions exist. */
-const PIPES_MIN_SLOTS = 5;
+const PIPE_RUNS_PER_GROUP = 10;
+
+interface SidebarPipeInventoryItem {
+  name: string;
+  executionCount?: number;
+  lastRun?: string | null;
+}
 
 interface ChatSidebarProps {
   className?: string;
@@ -395,19 +402,123 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
     [recents],
   );
 
-  const pipeGroupedSections = useMemo(
-    () => buildSidebarRecentsSections(pipes, Number.POSITIVE_INFINITY),
-    [pipes],
-  );
-  // Flatten pipe grouped sections into a single items list for rendering
-  const pipeItems = useMemo(
-    () => pipeGroupedSections.flatMap((section) => section.items),
-    [pipeGroupedSections],
-  );
-
   const [pipesCollapsed, setPipesCollapsed] = useCollapsedPref(
     "screenpipe:pipes-collapsed",
     true
+  );
+  const [pipeInventory, setPipeInventory] = useState<SidebarPipeInventoryItem[]>([]);
+  const [pipeInventoryLoaded, setPipeInventoryLoaded] = useState(false);
+  const [pipeInventoryAuthoritative, setPipeInventoryAuthoritative] = useState(false);
+  const [loadedPipeRuns, setLoadedPipeRuns] = useState<Record<string, SessionRecord[]>>({});
+  const [loadingPipeRuns, setLoadingPipeRuns] = useState<Set<string>>(() => new Set());
+
+  const fetchPipeInventory = useCallback(async () => {
+    try {
+      const response = await localFetch("/pipes?include_execution_counts=true");
+      if (!response.ok) return;
+      const payload = await response.json();
+      const inventory: SidebarPipeInventoryItem[] = [];
+      for (const pipe of payload.data ?? []) {
+        const name = pipe?.config?.name;
+        if (typeof name !== "string") continue;
+        inventory.push({
+          name,
+          executionCount:
+            typeof pipe.execution_count === "number" ? pipe.execution_count : undefined,
+          lastRun: typeof pipe.last_run === "string" ? pipe.last_run : null,
+        });
+      }
+      inventory.sort((a, b) => {
+        const lastRunOrder = (b.lastRun ?? "").localeCompare(a.lastRun ?? "");
+        return lastRunOrder || a.name.localeCompare(b.name);
+      });
+      setPipeInventory(inventory);
+      setPipeInventoryAuthoritative(true);
+    } catch {
+      // Keep recent in-memory pipe groups available if the engine is still
+      // starting or an older build does not expose the inventory endpoint.
+    } finally {
+      setPipeInventoryLoaded(true);
+    }
+  }, []);
+
+  // Inventory + exact counts are lazy at the section level. A collapsed Pipes
+  // section does no disk reload or execution-count query.
+  useEffect(() => {
+    if (!pipesCollapsed) void fetchPipeInventory();
+  }, [pipesCollapsed, fetchPipeInventory]);
+  useInterval(
+    () => void fetchPipeInventory(),
+    pipesCollapsed ? null : 15_000,
+  );
+
+  const loadPipeRuns = useCallback(async (pipeName: string) => {
+    if (loadingPipeRuns.has(pipeName) || loadedPipeRuns[pipeName]) return;
+    setLoadingPipeRuns((prev) => new Set(prev).add(pipeName));
+    try {
+      const metas = await listConversations({
+        limit: PIPE_RUNS_PER_GROUP,
+        includeHidden: false,
+        kind: "pipe-run",
+        pipeName,
+      });
+      const records = metas.map(sessionRecordFromMeta);
+      const storeActions = useChatStore.getState().actions;
+      for (const record of records) storeActions.upsert(record);
+      setLoadedPipeRuns((prev) => ({ ...prev, [pipeName]: records }));
+    } catch {
+      setLoadedPipeRuns((prev) => ({ ...prev, [pipeName]: [] }));
+    } finally {
+      setLoadingPipeRuns((prev) => {
+        const next = new Set(prev);
+        next.delete(pipeName);
+        return next;
+      });
+    }
+  }, [loadedPipeRuns, loadingPipeRuns]);
+
+  const pipeItems = useMemo(() => {
+    const sessionsByPipe = new Map<string, SessionRecord[]>();
+    for (const session of pipes) {
+      const name = session.pipeContext?.pipeName;
+      if (!name) continue;
+      const bucket = sessionsByPipe.get(name);
+      if (bucket) bucket.push(session);
+      else sessionsByPipe.set(name, [session]);
+    }
+
+    const inventoryNames = new Set(pipeInventory.map((pipe) => pipe.name));
+    const orderedNames = [
+      ...pipeInventory.map((pipe) => pipe.name),
+      ...Array.from(sessionsByPipe.keys()).filter((name) => !inventoryNames.has(name)),
+    ];
+
+    return orderedNames.map((name) => {
+      // Keep a newly-started watch/run visible after history was loaded, while
+      // deduping the same saved row returned by both sources.
+      const merged = [...(sessionsByPipe.get(name) ?? []), ...(loadedPipeRuns[name] ?? [])];
+      const seen = new Set<string>();
+      const sessions = merged.filter((session) => {
+        if (seen.has(session.id)) return false;
+        seen.add(session.id);
+        return true;
+      }).slice(0, PIPE_RUNS_PER_GROUP);
+      return {
+        kind: "group" as const,
+        key: `pipe:${name}`,
+        title: name,
+        sessions,
+      };
+    });
+  }, [pipeInventory, pipes, loadedPipeRuns]);
+
+  const pipeExecutionCounts = useMemo(
+    () => Object.fromEntries(
+      pipeInventory.flatMap((pipe) =>
+        pipe.executionCount == null ? [] : [[pipe.name, pipe.executionCount]],
+      ),
+    ) as Record<string, number>,
+    [pipeInventory],
   );
 
   // Auto-expand the pipes section when the current session is a pipe run
@@ -470,6 +581,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
     return set;
   });
   const toggleGroupExpanded = (key: string) => {
+    const wasExpanded = expandedGroups.has(key);
     setExpandedGroups((prev) => {
       const next = new Set(prev);
       const expanded = next.has(key);
@@ -486,7 +598,17 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
       } catch { /* ignore */ }
       return next;
     });
+    if (!wasExpanded && key.startsWith("pipe:")) {
+      void loadPipeRuns(key.slice("pipe:".length));
+    }
   };
+
+  // Restore lazy children for groups persisted as expanded across restarts.
+  useEffect(() => {
+    for (const key of expandedGroups) {
+      if (key.startsWith("pipe:")) void loadPipeRuns(key.slice("pipe:".length));
+    }
+  }, [expandedGroups, loadPipeRuns]);
 
   // Auto-expand the pipe group containing the current session so the
   // highlighted row is visible (e.g. after "open in chat" from Pipes).
@@ -508,8 +630,12 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
   // (pre-cap) recents list so we don't accidentally prune keys for
   // real groups that are past the 15-row cap.
   useEffect(() => {
+    if (!pipeInventoryAuthoritative) return;
     try {
-      const validKeys = recurringPipeGroupKeys(recents);
+      const validKeys = new Set([
+        ...recurringPipeGroupKeys(recents),
+        ...pipeItems.map((item) => item.key),
+      ]);
       const toRemove: string[] = [];
       for (let i = 0; i < localStorage.length; i++) {
         const k = localStorage.key(i);
@@ -520,7 +646,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
       }
       for (const k of toRemove) localStorage.removeItem(k);
     } catch { /* ignore */ }
-  }, [recents]);
+  }, [recents, pipeItems, pipeInventoryAuthoritative]);
 
   // GC stale manual subsection collapse-state keys when sidebar groups are
   // renamed or disappear. Only titled subsections participate.
@@ -572,26 +698,10 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
   const openAllCollapsed = recentsCollapsed && (archived.length === 0 || archivedCollapsed);
   const recentsLoading = !diskHydrated && recents.length === 0 && pipes.length === 0;
 
-  // When pipes exist, recents cap at (SIDEBAR_CAP - PIPES_MIN_SLOTS),
-  // reserving at least PIPES_MIN_SLOTS for pipes. If recents use
-  // fewer slots, pipes get the surplus.
-  const recentsCap = pipes.length > 0
-    ? SIDEBAR_CAP - PIPES_MIN_SLOTS
-    : SIDEBAR_CAP;
+  const recentsCap = SIDEBAR_CAP;
   const visibleGroupedSections = useMemo(
     () => applySidebarRecentsCap(groupedSections, collapsedRecentsSections, recentsCap),
     [groupedSections, collapsedRecentsSections, recentsCap],
-  );
-  const recentsRowCount = useMemo(
-    () => visibleGroupedSections.reduce((sum, s) => sum + s.items.length, 0),
-    [visibleGroupedSections],
-  );
-  const pipesCap = pipes.length > 0
-    ? Math.max(0, SIDEBAR_CAP - recentsRowCount)
-    : 0;
-  const visiblePipeItems = useMemo(
-    () => pipeItems.slice(0, pipesCap),
-    [pipeItems, pipesCap],
   );
 
   const handleSelect = (id: string) => {
@@ -873,8 +983,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
             </Section>
           </div>
 
-          {pipes.length > 0 && pipesCap > 0 && (
-            <div className="group/pipes min-h-0 flex flex-col shrink-0">
+          <div className="group/pipes min-h-0 flex flex-col shrink-0">
               <Section
                 title="pipes"
                 collapsed={pipesCollapsed}
@@ -884,27 +993,24 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
                 }
                 bodyClassName=""
               >
-                {visiblePipeItems.map((item) =>
-                  item.kind === "single" ? (
-                    <SidebarChatRow
-                      key={item.session.id}
-                      session={item.session}
-                      isCurrent={item.session.id === currentId}
-                      queuedCount={queueDepths.get(item.session.id) ?? 0}
-                      onSelect={handleSelect}
-                      onArchive={handleArchive}
-                      onUnarchive={handleUnarchive}
-                      onDeleteRequest={setDeletingSessionId}
-                      onTogglePin={handleTogglePin}
-                      onRenameRequest={handleRenameRequest}
-                      insideGroup
-                      openConversationMenuId={openConversationMenuId}
-                      setOpenConversationMenuId={setOpenConversationMenuId}
-                    />
-                  ) : (
+                {!pipeInventoryLoaded && pipeItems.length === 0 ? (
+                  <div className="px-2.5 py-2 space-y-1.5">
+                    {Array.from({ length: 3 }).map((_, i) => (
+                      <Skeleton key={i} className="h-6 w-full rounded-md" />
+                    ))}
+                  </div>
+                ) : pipeItems.length === 0 ? (
+                  <div className="px-2.5 py-2 text-xs text-muted-foreground/70 italic">
+                    no pipes installed
+                  </div>
+                ) : pipeItems.map((item) => (
                     <PipeGroupRow
                       key={item.key}
                       item={item}
+                      executionCount={pipeExecutionCounts[item.title]}
+                      executionCountLoading={!pipeInventoryLoaded}
+                      runsLoading={loadingPipeRuns.has(item.title)}
+                      runsLoaded={loadedPipeRuns[item.title] != null}
                       expanded={expandedGroups.has(item.key)}
                       onToggleExpand={() => toggleGroupExpanded(item.key)}
                       currentId={currentId}
@@ -921,11 +1027,9 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
                       openConversationMenuId={openConversationMenuId}
                       setOpenConversationMenuId={setOpenConversationMenuId}
                     />
-                  ),
-                )}
+                ))}
               </Section>
-            </div>
-          )}
+          </div>
         </div>
       </div>
 
@@ -1531,6 +1635,10 @@ function RecentsBody({
  */
 function PipeGroupRow({
   item,
+  executionCount,
+  executionCountLoading = false,
+  runsLoading = false,
+  runsLoaded = false,
   expanded,
   onToggleExpand,
   currentId,
@@ -1548,6 +1656,10 @@ function PipeGroupRow({
   setOpenConversationMenuId,
 }: {
   item: Extract<SidebarItem, { kind: "group" }>;
+  executionCount?: number;
+  executionCountLoading?: boolean;
+  runsLoading?: boolean;
+  runsLoaded?: boolean;
   expanded: boolean;
   onToggleExpand: () => void;
   currentId: string | null;
@@ -1578,7 +1690,7 @@ function PipeGroupRow({
         <span className="truncate flex-1 text-xs">{item.title}</span>
         <span className="inline-flex items-center gap-1.5 shrink-0">
           <span className="text-[10px] tabular-nums text-muted-foreground/60">
-            {item.sessions.length}
+            {executionCountLoading ? "…" : executionCount ?? item.sessions.length}
           </span>
           {expanded ? (
             <ChevronDown
@@ -1595,7 +1707,17 @@ function PipeGroupRow({
       </button>
       {expanded && (
         <div className="pl-3">
-          {item.sessions.map((s) => (
+          {runsLoading ? (
+            <div className="px-2 py-1.5 space-y-1.5" aria-busy="true">
+              {Array.from({ length: 3 }).map((_, i) => (
+                <Skeleton key={i} className="h-6 w-full rounded-md" />
+              ))}
+            </div>
+          ) : runsLoaded && item.sessions.length === 0 ? (
+            <div className="px-2 py-1.5 text-[11px] text-muted-foreground/60 italic">
+              no saved runs
+            </div>
+          ) : item.sessions.map((s) => (
             <SidebarChatRow
               key={s.id}
               session={s}

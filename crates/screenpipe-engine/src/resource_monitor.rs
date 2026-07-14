@@ -5,7 +5,7 @@
 use chrono::Local;
 use reqwest::Client;
 use serde_json::{json, Map};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -429,10 +429,52 @@ fn safe_process_name(process: &sysinfo::Process) -> String {
     }
 }
 
+fn descendant_process_ids(
+    root_pid: u32,
+    relationships: impl IntoIterator<Item = (u32, Option<u32>)>,
+) -> HashSet<u32> {
+    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (pid, parent_pid) in relationships {
+        if let Some(parent_pid) = parent_pid {
+            children_by_parent.entry(parent_pid).or_default().push(pid);
+        }
+    }
+
+    let mut descendants = HashSet::new();
+    let mut pending = vec![root_pid];
+    while let Some(parent_pid) = pending.pop() {
+        let Some(children) = children_by_parent.get(&parent_pid) else {
+            continue;
+        };
+        for &child_pid in children {
+            if child_pid == root_pid {
+                continue;
+            }
+            if descendants.insert(child_pid) {
+                pending.push(child_pid);
+            }
+        }
+    }
+    descendants
+}
+
+fn screenpipe_descendant_ids(sys: &System, current_pid: sysinfo::Pid) -> HashSet<u32> {
+    descendant_process_ids(
+        current_pid.as_u32(),
+        sys.processes().iter().map(|(pid, process)| {
+            (
+                pid.as_u32(),
+                process.parent().map(|parent_pid| parent_pid.as_u32()),
+            )
+        }),
+    )
+}
+
 fn related_process_group(
     current_pid: sysinfo::Pid,
     pid: sysinfo::Pid,
     process: &sysinfo::Process,
+    descendant_ids: &HashSet<u32>,
 ) -> Option<&'static str> {
     let text = process_search_text(process);
 
@@ -440,7 +482,7 @@ fn related_process_group(
         return Some("screenpipe_app");
     }
 
-    if text.contains("screenpipe-mcp") && process.parent() == Some(current_pid) {
+    if text.contains("screenpipe-mcp") && descendant_ids.contains(&pid.as_u32()) {
         return Some("screenpipe_mcp_child");
     }
 
@@ -448,7 +490,9 @@ fn related_process_group(
         return Some("screenpipe_mcp_external");
     }
 
-    if process.parent() == Some(current_pid) {
+    if descendant_ids.contains(&pid.as_u32()) {
+        // Keep the established group key for dashboard compatibility; it now
+        // includes the full child tree rather than only direct children.
         return Some("screenpipe_app_child");
     }
 
@@ -858,28 +902,20 @@ impl ResourceMonitor {
     ) {
         let pid = std::process::id();
         let mut total_memory = 0.0;
-        let mut max_virtual_memory = 0.0; // Changed from total to max
+        let mut max_virtual_memory: f64 = 0.0; // Changed from total to max
         let mut total_cpu = 0.0;
 
-        if let Some(main_process) = sys.process(sysinfo::Pid::from_u32(pid)) {
-            total_memory += main_process.memory() as f64 / (1024.0 * 1024.0 * 1024.0);
-
-            // Take the maximum virtual memory instead of sum
-            max_virtual_memory = main_process.virtual_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
-
-            total_cpu += main_process.cpu_usage();
-
-            // Add child processes
-            for child_process in sys.processes().values() {
-                if child_process.parent() == Some(sysinfo::Pid::from_u32(pid)) {
-                    total_memory += child_process.memory() as f64 / (1024.0 * 1024.0 * 1024.0);
-
-                    // Take max instead of sum
-                    max_virtual_memory = max_virtual_memory
-                        .max(child_process.virtual_memory() as f64 / (1024.0 * 1024.0 * 1024.0));
-
-                    total_cpu += child_process.cpu_usage();
+        let current_pid = sysinfo::Pid::from_u32(pid);
+        if sys.process(current_pid).is_some() {
+            let descendant_ids = screenpipe_descendant_ids(sys, current_pid);
+            for (process_pid, process) in sys.processes() {
+                if *process_pid != current_pid && !descendant_ids.contains(&process_pid.as_u32()) {
+                    continue;
                 }
+                total_memory += process.memory() as f64 / (1024.0 * 1024.0 * 1024.0);
+                max_virtual_memory = max_virtual_memory
+                    .max(process.virtual_memory() as f64 / (1024.0 * 1024.0 * 1024.0));
+                total_cpu += process.cpu_usage();
             }
         }
 
@@ -1008,11 +1044,13 @@ impl ResourceMonitor {
 
     fn collect_process_breakdown(sys: &System) -> ProcessBreakdown {
         let current_pid = sysinfo::Pid::from_u32(std::process::id());
+        let descendant_ids = screenpipe_descendant_ids(sys, current_pid);
         let mut groups: BTreeMap<&'static str, (usize, f64, f32)> = BTreeMap::new();
         let mut related_processes = Vec::new();
 
         for (pid, process) in sys.processes() {
-            let Some(group) = related_process_group(current_pid, *pid, process) else {
+            let Some(group) = related_process_group(current_pid, *pid, process, &descendant_ids)
+            else {
                 continue;
             };
 
@@ -1295,7 +1333,36 @@ impl ResourceMonitor {
 
 #[cfg(test)]
 mod tests {
-    use super::{analyze_memory_trend, LoadAverage, LEAK_WARMUP_SECS};
+    use super::{analyze_memory_trend, descendant_process_ids, LoadAverage, LEAK_WARMUP_SECS};
+
+    #[test]
+    fn descendant_process_ids_walks_the_full_tree() {
+        let relationships = [
+            (10, Some(1)),
+            (11, Some(10)),
+            (12, Some(11)),
+            (13, Some(10)),
+            (99, Some(1)),
+        ];
+
+        let descendants = descendant_process_ids(10, relationships);
+
+        assert_eq!(descendants.len(), 3);
+        assert!(descendants.contains(&11));
+        assert!(descendants.contains(&12));
+        assert!(descendants.contains(&13));
+        assert!(!descendants.contains(&10));
+        assert!(!descendants.contains(&99));
+    }
+
+    #[test]
+    fn descendant_process_ids_tolerates_cycles() {
+        let descendants = descendant_process_ids(10, [(11, Some(10)), (10, Some(11))]);
+
+        assert!(descendants.contains(&11));
+        assert!(!descendants.contains(&10));
+        assert_eq!(descendants.len(), 1);
+    }
 
     #[test]
     fn load_average_is_normalized_by_logical_cpu_count() {

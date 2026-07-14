@@ -2391,7 +2391,20 @@ async writeBrowserLogs(entries: BrowserLogEntry[]) : Promise<void> {
 export type AIPreset = { id: string; prompt: string; provider: AIProviderType; url?: string; model?: string; defaultPreset: boolean; apiKey: string | null; maxContextChars: number; maxTokens?: number }
 export type AIProviderType = "openai" | "openai-chatgpt" | "native-ollama" | "custom" | "screenpipe-cloud" | "pi" | "anthropic"
 export type AecMode = "off" | "screenpipe" | "macos" | "windows"
-export type AudioDeviceInfo = { name: string; isDefault: boolean }
+export type AudioDeviceInfo = { name: string; isDefault: boolean;
+/**
+ * True for a Bluetooth *input* device that is also a combo headset (the
+ * same hardware exposes an output side) — i.e. exactly the devices the
+ * `alwaysRecordBluetoothMic` gate actually holds back outside a
+ * detected meeting. A dedicated Bluetooth mic with no output side is
+ * never gated, so this is `false` for one even though it's Bluetooth.
+ * Mirrors `AudioManager::start_device`'s real gate condition
+ * (screenpipe-audio's `device_detection::bluetooth_mic_allowed` +
+ * `device::bluetooth_input_is_combo_headset`) so the settings UI's
+ * "meetings only" hint matches actual recording behavior instead of
+ * guessing from the device name.
+ */
+isComboBluetoothMic: boolean }
 export type BootPhaseSnapshot = {
 /**
  * One of: idle | starting | migrating_database | building_audio |
@@ -2447,7 +2460,13 @@ export type CalendarStatus = { available: boolean; authorized: boolean; authoriz
  * [`list_chat_entries_by_mtime`].
  */
 export type ChatDirEntry = { name: string; mtime_ms: number }
-export type ChatGptOAuthStatus = { logged_in: boolean }
+export type ChatGptOAuthStatus = { logged_in: boolean;
+/**
+ * `None` when the store was read successfully; contains an error
+ * description when the status could not be determined (DB locked,
+ * keychain failure, timeout, etc.).
+ */
+error: string | null }
 export type Credits = { amount: number }
 /**
  * A skill folder discovered somewhere on the user's device.
@@ -2755,6 +2774,22 @@ experimentalCoreaudioSystemAudio?: boolean;
  * less capture than with the flag off.
  */
 experimentalMeetingPiggyback?: boolean;
+/**
+ * Opening a Bluetooth microphone always forces the paired device's audio
+ * link out of A2DP into SCO, degrading the user's headphone/speaker
+ * output quality (48kHz stereo -> 24kHz stereo or mono HFP, depending on
+ * hardware) — a macOS/OS-level tradeoff with no external workaround
+ * (issue #3750). Default `false`: Bluetooth input devices are only
+ * actually opened while a meeting is detected; outside a meeting they
+ * stay enabled-but-gated (selected in settings, not streaming) so the
+ * Bluetooth link stays in A2DP. Set `true` to always record Bluetooth
+ * mics regardless of meeting state (prior behavior). Has no effect on
+ * wired/built-in/unrecognized mics, on Bluetooth output devices, or on a
+ * dedicated Bluetooth microphone with no output side of its own (macOS:
+ * confirmed via `bluetooth_input_is_combo_headset` — nothing to protect
+ * there, since there's no headphone output on that hardware to degrade).
+ */
+alwaysRecordBluetoothMic?: boolean;
 /**
  * Experimental: request Windows WASAPI microphone Acoustic Echo Cancellation.
  * Ignored on non-Windows platforms and fail-open when unsupported by device/driver.

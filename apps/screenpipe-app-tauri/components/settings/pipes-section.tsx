@@ -133,7 +133,7 @@ import { useDeviceMonitor } from "@/lib/hooks/use-device-monitor";
 import { Monitor, Wifi, WifiOff, ScanSearch } from "lucide-react";
 import { requestPipeStop } from "@/lib/pipe-stop";
 
-const PIPE_EXECUTIONS_PAGE_LIMIT = 100;
+const PIPE_EXECUTIONS_PAGE_LIMIT = 10;
 
 function pipeExecutionsUrl(apiBase: string, pipeName: string, beforeId?: number) {
   const params = new URLSearchParams({
@@ -602,6 +602,7 @@ interface PipeStatus {
   source_slug?: string;
   installed_version?: number;
   locally_modified?: boolean;
+  execution_count?: number;
 }
 
 interface PipeRunLog {
@@ -1219,7 +1220,7 @@ export function PipesSection() {
   const fetchPipes = useCallback(async () => {
     try {
       setLoadError(null);
-      // Load pipes WITH recent executions inline so the list shows the real
+      // Load pipes WITH only their newest execution inline so the list shows the real
       // last-run status. Without this the "last run" column always reads
       // "never run" for pipes that have actually run (the badge is driven by
       // recent_executions). The engine batches this into one fast per-pipe
@@ -1229,8 +1230,8 @@ export function PipesSection() {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5_000);
       const pipesEndpoint = isRemote
-        ? `${apiBase}/pipes?include_executions=true`
-        : "/pipes?include_executions=true";
+        ? `${apiBase}/pipes?include_executions=true&execution_limit=1&include_execution_counts=true`
+        : "/pipes?include_executions=true&execution_limit=1&include_execution_counts=true";
       const res = await localFetch(pipesEndpoint, { signal: controller.signal }).finally(() => clearTimeout(timeout));
       if (!res.ok) {
         throw new Error(`pipes api returned ${res.status}`);
@@ -1712,7 +1713,12 @@ export function PipesSection() {
       const data = await res.json();
       const nextExecutions = data.data || [];
       setExecutions(nextExecutions);
-      setHasMoreExecutions(nextExecutions.length === PIPE_EXECUTIONS_PAGE_LIMIT);
+      const total = pipes.find((pipe) => pipe.config.name === name)?.execution_count;
+      setHasMoreExecutions(
+        total != null
+          ? nextExecutions.length < total
+          : nextExecutions.length === PIPE_EXECUTIONS_PAGE_LIMIT,
+      );
     } catch (e) {
       // Executions endpoint may not exist on older servers — fall back silently
       setExecutions([]);
@@ -1732,14 +1738,18 @@ export function PipesSection() {
       const res = await fetch(pipeExecutionsUrl(apiBase, name, oldestId));
       const data = await res.json();
       const olderExecutions: PipeExecution[] = data.data || [];
-      setExecutions((prev) => {
-        const seen = new Set(prev.map((exec) => exec.id));
-        return [
-          ...prev,
-          ...olderExecutions.filter((exec) => !seen.has(exec.id)),
-        ];
-      });
-      setHasMoreExecutions(olderExecutions.length === PIPE_EXECUTIONS_PAGE_LIMIT);
+      const total = pipes.find((pipe) => pipe.config.name === name)?.execution_count;
+      const seen = new Set(executions.map((exec) => exec.id));
+      const next = [
+        ...executions,
+        ...olderExecutions.filter((exec) => !seen.has(exec.id)),
+      ];
+      setExecutions(next);
+      setHasMoreExecutions(
+        total != null
+          ? next.length < total
+          : olderExecutions.length === PIPE_EXECUTIONS_PAGE_LIMIT,
+      );
     } catch (e) {
       console.error("failed to fetch older executions:", e);
     } finally {
@@ -2799,7 +2809,9 @@ export function PipesSection() {
                           config
                         </TabsTrigger>
                         <TabsTrigger value="runs" className="rounded-none border-b-2 border-transparent data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none text-xs uppercase tracking-wider px-3 h-8">
-                          runs{executions.length > 0 ? ` (${executions.length})` : ""}
+                          runs{(pipe.execution_count ?? executions.length) > 0
+                            ? ` (${pipe.execution_count ?? executions.length})`
+                            : ""}
                         </TabsTrigger>
                         <TabsTrigger value="advanced" className="rounded-none border-b-2 border-transparent data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none text-xs uppercase tracking-wider px-3 h-8">
                           advanced
