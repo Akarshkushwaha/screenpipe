@@ -7,6 +7,7 @@ import React from "react";
 import { ShareLogsButton } from "@/components/share-logs-button";
 import { MessageSquare, Github, Lightbulb, FileText, Youtube, BookOpen, Play, ClipboardList } from "lucide-react";
 import { open } from "@tauri-apps/plugin-shell";
+import { showIntercom } from "@/components/intercom-provider";
 
 function DiscordIcon(props: React.SVGProps<SVGSVGElement>) {
   return (
@@ -39,6 +40,24 @@ export function FeedbackSection() {
             </div>
           </div>
           <ShareLogsButton />
+        </div>
+
+        <div className="px-3 py-2.5 bg-card border border-border">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2.5">
+              <MessageSquare className="h-4 w-4 text-muted-foreground shrink-0" />
+              <div>
+                <h3 className="text-sm font-medium text-foreground">Live chat with us</h3>
+                <p className="text-xs text-muted-foreground">talk to our AI or support team directly</p>
+              </div>
+            </div>
+            <button
+              onClick={() => showIntercom()}
+              className="text-xs text-muted-foreground hover:text-foreground transition-colors duration-150"
+            >
+              open chat →
+            </button>
+          </div>
         </div>
 
         <button
