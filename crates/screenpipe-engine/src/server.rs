@@ -837,6 +837,14 @@ impl SCServer {
             )
             .get("/retention/status", crate::retention::retention_status)
             .post("/retention/run", crate::retention::retention_run)
+            .post(
+                "/retention/compress-now",
+                crate::retention::retention_compress_now,
+            )
+            .post(
+                "/retention/export-cold-parquet",
+                crate::retention::retention_export_cold_parquet,
+            )
             // Data management
             .post("/data/delete-range", delete_time_range_handler)
             .post("/data/evict-media", evict_media_handler)

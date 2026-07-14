@@ -365,6 +365,32 @@ impl DatabaseManager {
             }
         }
 
+        // Merge cold storage historical results from Parquet partitions
+        let query_opt = if query.trim().is_empty() {
+            None
+        } else {
+            Some(query)
+        };
+        let (cold_limit, cold_offset) = if matches!(content_type, ContentType::All) {
+            (limit.saturating_add(offset) as usize, 0)
+        } else {
+            (limit as usize, offset as usize)
+        };
+        if let Ok(cold_results) = self
+            .cold_storage
+            .search_cold_parquet(
+                query_opt,
+                content_type.clone(),
+                start_time,
+                end_time,
+                cold_limit,
+                cold_offset,
+            )
+            .await
+        {
+            results.extend(cold_results);
+        }
+
         // Sort results by timestamp in descending order
         results.sort_by(|a, b| {
             let timestamp_a = match a {

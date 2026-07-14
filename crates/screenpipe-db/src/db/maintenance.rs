@@ -1570,4 +1570,80 @@ impl DatabaseManager {
             .await;
         result
     }
+
+    /// Exports hot-tier data older than `cutoff` to Parquet daily partitions and safely prunes them from SQLite.
+    /// Also runs incremental vacuum to recycle or return pages to the OS if auto_vacuum is enabled.
+    pub async fn run_cold_tier_export_and_prune(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<
+        (
+            crate::db::cold_storage::ExportStats,
+            crate::db::cold_storage::PruneStats,
+        ),
+        anyhow::Error,
+    > {
+        info!(
+            "Starting cold tier export and prune for records older than {}",
+            cutoff
+        );
+
+        // Find earliest timestamp in frames or audio to determine start of range
+        let min_frame_ts: Option<String> = sqlx::query_scalar("SELECT MIN(timestamp) FROM frames")
+            .fetch_optional(&self.pool)
+            .await?;
+        let min_audio_ts: Option<String> =
+            sqlx::query_scalar("SELECT MIN(timestamp) FROM audio_transcriptions")
+                .fetch_optional(&self.pool)
+                .await?;
+
+        let earliest_str = match (min_frame_ts, min_audio_ts) {
+            (Some(f), Some(a)) => {
+                if f < a {
+                    f
+                } else {
+                    a
+                }
+            }
+            (Some(f), None) => f,
+            (None, Some(a)) => a,
+            (None, None) => {
+                info!("No records found in frames or audio_transcriptions to export.");
+                return Ok((Default::default(), Default::default()));
+            }
+        };
+
+        let start_ts = earliest_str
+            .parse::<DateTime<Utc>>()
+            .unwrap_or_else(|_| DateTime::from_timestamp(0, 0).unwrap_or_default());
+
+        if start_ts >= cutoff {
+            info!(
+                "All records are newer than cutoff ({}), nothing to export or prune.",
+                cutoff
+            );
+            return Ok((Default::default(), Default::default()));
+        }
+
+        let export_stats = self
+            .cold_storage
+            .export_range_to_parquet(&self.pool, start_ts, cutoff)
+            .await?;
+
+        let prune_stats = self
+            .cold_storage
+            .prune_hot_tier_after_export(&self.pool, cutoff)
+            .await?;
+
+        let _ = self
+            .execute_raw_sql("PRAGMA incremental_vacuum(2000)")
+            .await;
+
+        info!(
+            "Cold tier maintenance complete: exported {:?}, pruned {:?}",
+            export_stats, prune_stats
+        );
+
+        Ok((export_stats, prune_stats))
+    }
 }

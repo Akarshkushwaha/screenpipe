@@ -113,6 +113,21 @@ impl DatabaseManager {
                 ..Default::default()
             },
         );
+        let cold_dir = if database_path.starts_with("sqlite::memory:") {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            std::env::temp_dir().join(format!("screenpipe_cold_memory_{}", nanos))
+        } else {
+            std::path::Path::new(database_path)
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join("cold_storage")
+                .join("parquet")
+        };
+        let cold_storage = Arc::new(crate::db::cold_storage::ColdStorageManager::new(cold_dir));
+
         let db_manager = DatabaseManager {
             pool: read_pool,
             write_pool,
@@ -122,6 +137,7 @@ impl DatabaseManager {
             write_queue_health,
             persistent_failure_hook,
             close_token,
+            cold_storage,
         };
 
         // Checkpoint any stale WAL before running migrations or starting captures.

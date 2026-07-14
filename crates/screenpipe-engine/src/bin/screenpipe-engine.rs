@@ -1628,6 +1628,9 @@ async fn main() -> anyhow::Result<()> {
                     "lean (keep text+memories)".to_string()
                 }
                 screenpipe_engine::retention::RetentionMode::All => "all (full delete)".to_string(),
+                screenpipe_engine::retention::RetentionMode::ArchiveSummarize => {
+                    "archive_summarize (export cold parquet + AI memories)".to_string()
+                }
             }
         }
     );

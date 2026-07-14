@@ -244,6 +244,8 @@ pub struct DatabaseManager {
     /// db in this process fail with SQLITE_IOERR (code 522) until a full process
     /// restart (2026-07-02 incident).
     close_token: tokio_util::sync::CancellationToken,
+    /// Cold storage manager for Parquet historical partitions.
+    pub cold_storage: Arc<ColdStorageManager>,
 }
 
 /// One level-0 OCR element row, buffered for bulk insertion.
@@ -364,6 +366,8 @@ async fn flush_ax_bulk(
 
 mod accessibility;
 mod audio;
+mod cold_query;
+pub mod cold_storage;
 mod display_layout;
 mod elements;
 mod frames;
@@ -378,6 +382,7 @@ mod tags;
 mod text_positions;
 mod write_ops;
 
+pub use self::cold_storage::{ColdStorageManager, ExportStats, PruneStats};
 pub(crate) use self::text_positions::calculate_confidence;
 pub use self::text_positions::{
     find_matching_a11y_positions, find_matching_positions, parse_all_text_positions,
@@ -386,6 +391,8 @@ pub use self::text_positions::{
 #[cfg(test)]
 pub(crate) use self::text_positions::narrow_bbox_to_needle;
 
+#[cfg(test)]
+mod cold_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

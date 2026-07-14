@@ -28,6 +28,7 @@ pub mod logging;
 pub mod mcp_servers_api;
 pub mod meeting_export;
 pub mod meeting_watcher;
+pub mod memory_compression;
 mod oauth_result_page;
 pub mod permission_monitor;
 pub mod piggyback_telemetry;

@@ -72,6 +72,8 @@ pub enum RetentionMode {
     Media,
     Lean,
     All,
+    #[serde(alias = "archive_summarize")]
+    ArchiveSummarize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,6 +294,116 @@ pub async fn retention_run(
     info!("retention: manual run triggered");
 
     Ok(JsonResponse(json!({"success": true})))
+}
+
+#[derive(Debug, Deserialize, OaSchema)]
+pub struct RetentionActionRequest {
+    pub retention_days: Option<u32>,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+}
+
+/// POST /retention/compress-now — trigger immediate AI compression and markdown archive generation.
+#[oasgen]
+pub async fn retention_compress_now(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RetentionActionRequest>,
+) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
+    let runner = crate::memory_compression::MemoryCompressionRunner::new(
+        state.db.clone(),
+        crate::memory_compression::MemoryCompressionConfig::default(),
+    );
+
+    let stats = if let (Some(start_str), Some(end_str)) = (&req.start_time, &req.end_time) {
+        let start = start_str.parse::<DateTime<Utc>>().map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                JsonResponse(json!({"error": format!("invalid start_time: {}", e)})),
+            )
+        })?;
+        let end = end_str.parse::<DateTime<Utc>>().map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                JsonResponse(json!({"error": format!("invalid end_time: {}", e)})),
+            )
+        })?;
+        runner.compress_time_range(start, end).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({"error": e.to_string()})),
+            )
+        })?
+    } else {
+        let days = req.retention_days.unwrap_or(30) as i64;
+        let cutoff = Utc::now() - Duration::days(days);
+        runner
+            .compress_and_archive_all_older_than(cutoff)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonResponse(json!({"error": e.to_string()})),
+                )
+            })?
+    };
+
+    Ok(JsonResponse(json!({
+        "success": true,
+        "stats": stats
+    })))
+}
+
+/// POST /retention/export-cold-parquet — trigger immediate cold tier export and safe pruning.
+#[oasgen]
+pub async fn retention_export_cold_parquet(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RetentionActionRequest>,
+) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
+    let stats = if let (Some(start_str), Some(end_str)) = (&req.start_time, &req.end_time) {
+        let start = start_str.parse::<DateTime<Utc>>().map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                JsonResponse(json!({"error": format!("invalid start_time: {}", e)})),
+            )
+        })?;
+        let end = end_str.parse::<DateTime<Utc>>().map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                JsonResponse(json!({"error": format!("invalid end_time: {}", e)})),
+            )
+        })?;
+        let export_stats = state
+            .db
+            .cold_storage
+            .export_range_to_parquet(&state.db.pool, start, end)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonResponse(json!({"error": e.to_string()})),
+                )
+            })?;
+        json!({ "export_stats": export_stats })
+    } else {
+        let days = req.retention_days.unwrap_or(30) as i64;
+        let cutoff = Utc::now() - Duration::days(days);
+        let (export_stats, prune_stats) = state
+            .db
+            .run_cold_tier_export_and_prune(cutoff)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonResponse(json!({"error": e.to_string()})),
+                )
+            })?;
+        json!({ "export_stats": export_stats, "prune_stats": prune_stats })
+    };
+
+    Ok(JsonResponse(json!({
+        "success": true,
+        "stats": stats
+    })))
 }
 
 // ============================================================================
@@ -608,6 +720,45 @@ async fn do_local_cleanup(
                     }
                 }
             }
+            RetentionMode::ArchiveSummarize => {
+                let runner = crate::memory_compression::MemoryCompressionRunner::new(
+                    db.clone(),
+                    crate::memory_compression::MemoryCompressionConfig::default(),
+                );
+                match runner.compress_time_range(batch_start, batch_end).await {
+                    Ok(stats) => {
+                        info!(
+                            "retention: ArchiveSummarize compression completed: {:?}",
+                            stats
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "retention: ArchiveSummarize compression failed for range {} to {}: {}",
+                            batch_start, batch_end, e
+                        );
+                    }
+                }
+                match db.run_cold_tier_export_and_prune(batch_end).await {
+                    Ok((export_stats, prune_stats)) => {
+                        let batch_total = prune_stats.frames_deleted
+                            + prune_stats.audio_deleted
+                            + prune_stats.ui_events_deleted;
+                        if batch_total > 0 {
+                            any_deleted = true;
+                            info!(
+                                "retention: ArchiveSummarize exported {:?}, pruned {:?}",
+                                export_stats, prune_stats
+                            );
+                        }
+                        total += batch_total;
+                    }
+                    Err(e) => {
+                        warn!("retention: ArchiveSummarize export & prune failed for range {} to {}: {}", batch_start, batch_end, e);
+                        batch_failed = true;
+                    }
+                }
+            }
         }
 
         if batch_failed {
@@ -642,7 +793,10 @@ async fn do_local_cleanup(
         // without a full VACUUM (intentionally not run here — it takes an
         // exclusive lock that would stall live capture). Kept so the reclaim
         // becomes real if/when the DB is migrated to incremental auto_vacuum.
-        if matches!(mode, RetentionMode::All | RetentionMode::Lean) {
+        if matches!(
+            mode,
+            RetentionMode::All | RetentionMode::Lean | RetentionMode::ArchiveSummarize
+        ) {
             info!("retention: running incremental vacuum (reclaims pages only under auto_vacuum=incremental)");
             if let Err(e) = db.execute_raw_sql("PRAGMA incremental_vacuum(1000)").await {
                 warn!("retention: incremental vacuum failed: {}", e);
